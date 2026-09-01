@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Gazebo での連続走行検証。
+#
+#   ./run_sim.sh [out_dir] [duration_s]
+#
+# Gazebo Classic + gazebo_ros を持つイメージの中で、
+#   world + 地図 (make_env.py が同じ壁定義から生成) -> Gazebo -> ロボット spawn
+#   -> ofl_node -> 経路追従 + 誤差記録
+# を回す。制御は真値で行い、位置推定は受け身の観測者として評価する。
+#
+# 環境変数:
+#   IMAGE       使用する docker イメージ (Gazebo Classic + gazebo_ros が要る)
+#   KIDNAP_AT   この秒数で瞬間移動させる (kidnap からの復帰を見る)
+#   OFL_ARGS    ofl_node へ渡す追加パラメータ (例: "-p enable_track:=false")
+set -eo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PKG="$(cd "${HERE}/.." && pwd)"
+OUT="${1:-${HERE}/out}"
+DURATION="${2:-180}"
+IMAGE="${IMAGE:-bac_gazebo_runtime:humble}"
+
+mkdir -p "${OUT}"
+python3 "${HERE}/make_env.py" "${OUT}/env"
+
+docker run --rm --network none \
+    -v "${PKG}:/ws/src/oriented_field_localization:ro" \
+    -v "${OUT}:/out" \
+    -e "DURATION=${DURATION}" -e "KIDNAP_AT=${KIDNAP_AT:-}" \
+    -e "OFL_ARGS=${OFL_ARGS:-}" -e "OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}" \
+    --entrypoint /bin/bash "${IMAGE}" -lc '
+set -eo pipefail
+source /opt/ros/humble/setup.bash
+cd /ws
+colcon build --packages-select oriented_field_localization \
+    --cmake-args -DCMAKE_BUILD_TYPE=Release > /out/build.log 2>&1
+source install/setup.bash
+export GAZEBO_MODEL_PATH=/usr/share/gazebo-11/models:${GAZEBO_MODEL_PATH:-}
+
+# --- Gazebo (ヘッドレス) ---
+gzserver --verbose \
+    -s libgazebo_ros_init.so -s libgazebo_ros_factory.so \
+    /out/env/office.world > /out/gzserver.log 2>&1 &
+GZ=$!
+sleep 8
+
+# --- ロボットの spawn と TF ---
+URDF=/ws/src/oriented_field_localization/sim/models/robot.urdf
+ros2 run robot_state_publisher robot_state_publisher "${URDF}" \
+    --ros-args -p use_sim_time:=true > /out/rsp.log 2>&1 &
+sleep 2
+START=$(python3 -c "import json;s=json.load(open(\"/out/env/route.json\"))[\"start\"];print(f\"{s[0]} {s[1]} {s[2]}\")")
+set -- $START
+# 車輪半径 0.08 + 取り付け -0.02 なので base_link の高さは 0.10 で接地する
+ros2 run gazebo_ros spawn_entity.py -file "${URDF}" -entity ofl_bot \
+    -x "$1" -y "$2" -z 0.10 -Y "$3" > /out/spawn.log 2>&1
+sleep 3
+
+# --- 位置推定 ---
+# shellcheck disable=SC2086
+ros2 run oriented_field_localization ofl_node --ros-args \
+    -p use_sim_time:=true \
+    -p map_yaml_path:=/out/env/office.yaml \
+    -p auto_localize:=true \
+    -p tf_mode:=map_to_odom \
+    -p max_range:=10.0 \
+    -p margin_pixels:=284 \
+    ${OFL_ARGS} > /out/ofl.log 2>&1 &
+sleep 5
+
+# --- 走行と記録 ---
+KID=""
+[ -n "${KIDNAP_AT}" ] && KID="--kidnap-at ${KIDNAP_AT}"
+# 実時間の倍率が 1 を下回るので、sim 時間 DURATION には実時間でその数倍かかる。
+# 想定の 5 倍 + 余裕で頭打ちにして、何かが固まっても必ず後片付けへ進む。
+HARD=$(python3 -c "print(int(${DURATION} * 5 + 120))")
+# shellcheck disable=SC2086
+timeout -k 20 "${HARD}" python3 /ws/src/oriented_field_localization/sim/drive_node.py \
+    --route /out/env/route.json --out /out/run.csv \
+    --duration "${DURATION}" ${KID} \
+    --ros-args -p use_sim_time:=true > /out/drive.log 2>&1 || true
+
+kill ${GZ} 2>/dev/null || true
+sleep 2
+pkill -f gzserver 2>/dev/null || true
+pkill -f ofl_node 2>/dev/null || true
+pkill -f robot_state_publisher 2>/dev/null || true
+sleep 1
+exit 0
+'
+echo
+python3 "${HERE}/summarize_run.py" "${OUT}/run.csv"

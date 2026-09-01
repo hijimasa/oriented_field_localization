@@ -105,9 +105,15 @@ area; TRACK scales with the window only. On the largest map (52 x 50 m) GLOBAL m
 - The prior is the last accepted map pose plus the odometry delta since then. Without
   `/odom` it is the last accepted pose itself (assuming motion between scans fits inside
   `track_search_m`)
-- TRACK accepts or rejects on the **jump from the prior** (`max_accept_jump_m` /
-  `max_accept_yaw_deg`). The window is wide, so a solution that lands far away inside it is
-  treated as a one-off mismatch and dropped
+- TRACK accepts or rejects in two stages. (1) The **jump from the prior**
+  (`max_accept_jump_m` / `max_accept_yaw_deg`) drops one-off mismatches. (2) **WFRAC**
+  (`track_max_wfrac`) drops wrong locks.
+  **Without (2) a broken track cannot be detected.** The prior is built from the previous accepted
+  pose, so once the track lands somewhere wrong every later prior comes from that wrong place and no
+  solution ever looks like a jump. A wrong lock is self-consistent, so a jump gate cannot catch it in
+  principle (measured with a Gazebo kidnap: with the jump gate alone it never recovered in 120 s —
+  see [simulation.md](simulation.md)). WFRAC never consults the prior, so it jumps at a wrong lock
+  (median 0.000 when healthy against 0.74 at the wrong lock)
 - After enough consecutive rejects the prior is discarded and the node returns to GLOBAL
   (kidnap recovery)
 - Calling `~/global_localization` drops the tracking state and restarts from GLOBAL

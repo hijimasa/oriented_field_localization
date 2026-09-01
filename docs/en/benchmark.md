@@ -112,8 +112,8 @@ The local search used after convergence, measured on the same 5400 scans by givi
   GLOBAL's 24.5 ms (5.4x)
 
 **This is a simulation of prior error drawn from a uniform distribution, not real odometry
-error.** Continuous-driving behaviour (accumulated drift, sustained dynamic obstacles,
-recovery from kidnap) is not measured.
+error.** Following under accumulated drift and recovery from a kidnap are measured separately in
+Gazebo ([simulation.md](simulation.md)). Sustained dynamic obstacles are measured nowhere.
 
 ### Against the Radon sinogram method
 
@@ -155,9 +155,10 @@ space or image space**. The history and the mechanism are in
 - The corridor results (49-83%) show that **a self-similar environment does not resolve from
   a single scan**. That ambiguity belongs to odometry or motion.
 - Times come from one x86 machine; the ratio may differ on embedded hardware.
-- **TRACK is only measured as a one-shot local search.** The state machine (GLOBAL <-> TRACK
-  transitions, jump rejection, kidnap recovery) is checked by unit tests for its invariants,
-  but its behaviour over a continuous drive is not measured.
+- **TRACK here is measured as a one-shot local search.** The state machine (GLOBAL <-> TRACK
+  transitions, jump rejection, kidnap recovery) over a continuous drive is measured separately in
+  Gazebo ([simulation.md](simulation.md)). **That validation found the defect that a jump gate
+  cannot detect a wrong lock, which was fixed by adding the WFRAC gate.**
 
 ## Reproduction
 

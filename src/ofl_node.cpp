@@ -35,6 +35,7 @@
 #include <tf2_ros/transform_broadcaster.h>
 
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <fstream>
@@ -141,6 +142,12 @@ public:
     max_consecutive_rejects_ = declare_parameter("max_consecutive_rejects", 5);
     max_accept_jump_m_ = declare_parameter("max_accept_jump_m", 2.0);
     max_accept_yaw_deg_ = declare_parameter("max_accept_yaw_deg", 20.0);
+    // 誤ロックの検出。跳び判定だけでは足りない: 追跡が誤った場所へ乗ると、
+    // 以後の事前姿勢もその誤った場所から出るので「跳んでいない」と見えてしまい、
+    // 自分自身と整合したまま永久に戻れない (kidnap の実測で確認)。
+    // スキャン点が地図の壁に載らない割合 (WFRAC) は事前姿勢に依存しない
+    // 幾何量なので、誤ロックではっきり跳ね上がる。
+    track_max_wfrac_ = declare_parameter("track_max_wfrac", 0.35);
     use_odometry_ = declare_parameter("use_odometry", true);
     publish_initialpose_ = declare_parameter("publish_initialpose", true);
     map_frame_ = declare_parameter("map_frame", std::string("map"));
@@ -298,10 +305,11 @@ private:
   void onScan(const sensor_msgs::msg::LaserScan::SharedPtr msg)
   {
     {
+      // 処理中に届いたスキャンは捨てて最新だけを残す (古いスキャンで推定しても
+      // 出てくるのは過去の姿勢なので、溜めても意味が無い)
       std::lock_guard<std::mutex> lk(mu_);
-      last_scan_ = msg;
+      pending_scan_ = msg;
     }
-    if (auto_localize_) requested_ = true;
     cv_.notify_one();
   }
 
@@ -324,11 +332,15 @@ private:
       sensor_msgs::msg::LaserScan::SharedPtr scan;
       {
         std::unique_lock<std::mutex> lk(mu_);
-        cv_.wait(lk, [this] {return stop_ || (requested_ && last_scan_ && map_ready_);});
+        // 未処理のスキャンが 1 枚あり、かつ走る理由があるときだけ起きる。
+        // 走る理由 = TRACK 中 / auto_localize / サービス要求。
+        cv_.wait(lk, [this] {
+            return stop_ || (pending_scan_ && map_ready_ &&
+              (requested_ || tracking_ || auto_localize_));
+          });
         if (stop_) return;
-        scan = last_scan_;
-        // TRACK 中はスキャンごとに走り続ける。GLOBAL はサービス要求ごと
-        // (auto_localize なら毎スキャン)。
+        scan = pending_scan_;
+        pending_scan_.reset();          // 1 枚のスキャンは 1 回だけ処理する
         if (!(auto_localize_ || tracking_)) requested_ = false;
       }
       if (!scan) continue;
@@ -357,7 +369,7 @@ private:
       }
       const bool use_track = enable_track_ && tracking_ && have_prior;
 
-      const auto t0 = now();
+      const auto t0 = std::chrono::steady_clock::now();
       std::vector<PoseCandidate> cands;
       if (use_track) {
         PoseCandidate pr;
@@ -366,7 +378,8 @@ private:
       } else {
         cands = localizer_->localize(beams);
       }
-      const double dt = (now() - t0).seconds();
+      const double dt = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
 
       if (cands.empty()) {
         onReject("no candidate", use_track);
@@ -380,9 +393,10 @@ private:
       const double margin = (cands.size() > 1 && cands[1].score > 0)
         ? cands[0].score / cands[1].score : 1e9;
 
+      double wfrac = -1.0;
       if (use_track) {
-        // 事前姿勢からの跳びで採否を決める (TRACK の窓は広いので、窓の中でも
-        // 遠くへ飛んだ解は単発の誤マッチとみなして捨てる)
+        // (1) 事前姿勢からの跳び: TRACK の窓は広いので、窓の中でも遠くへ飛んだ解は
+        //     単発の誤マッチとみなして捨てる
         const double dpos = std::hypot(best.x - prior.x, best.y - prior.y);
         const double dyaw = std::fabs(wrapPi(best.yaw - prior.yaw)) * 180.0 / M_PI;
         if ((max_accept_jump_m_ > 0 && dpos > max_accept_jump_m_) ||
@@ -391,18 +405,28 @@ private:
           onReject("jump", true, dpos, dyaw);
           continue;
         }
+        // (2) 幾何の整合: 誤ロックは跳びでは捕まらないので、事前姿勢に依らない
+        //     WFRAC で見る
+        if (track_max_wfrac_ > 0) {
+          wfrac = localizer_->wallMissFraction(best, beams);
+          if (wfrac > track_max_wfrac_) {
+            onReject("wfrac", true, wfrac);
+            continue;
+          }
+        }
       } else if (margin < global_min_margin_) {
         onReject("margin", false, margin);
         continue;
       }
 
-      onAccept(best, odom_now, scan->header.stamp, use_track, margin, dt, cands.size());
+      onAccept(best, odom_now, scan->header.stamp, use_track, margin, dt, cands.size(),
+        wfrac);
     }
   }
 
   void onAccept(
     const PoseCandidate & best, const Pose2D & odom_now, const rclcpp::Time & stamp,
-    bool was_track, double margin, double dt, size_t n_cands)
+    bool was_track, double margin, double dt, size_t n_cands, double wfrac)
   {
     bool became_track = false;
     bool first_lock = false;
@@ -422,9 +446,10 @@ private:
     }
     publishPose(best, odom_now, stamp, /*also_initialpose=*/!was_track && first_lock);
     RCLCPP_INFO(get_logger(),
-      "%s accept (%.2f, %.2f, %.1f deg) score %.4f margin %.2f in %.0f ms (%zu cands)%s",
+      "%s accept (%.2f, %.2f, %.1f deg) score %.4f margin %.2f wfrac %.3f in %.0f ms "
+      "(%zu cands)%s",
       was_track ? "TRACK" : "GLOBAL", best.x, best.y, best.yaw * 180.0 / M_PI,
-      best.score, margin, 1e3 * dt, n_cands, became_track ? " -> TRACK" : "");
+      best.score, margin, wfrac, 1e3 * dt, n_cands, became_track ? " -> TRACK" : "");
   }
 
   void onReject(const char * why, bool was_track, double a = 0, double b = 0)
@@ -439,6 +464,7 @@ private:
         has_pose_ = false;      // 追跡喪失: 事前姿勢を捨てて GLOBAL から取り直す
         consecutive_rejects_ = 0;
         back_to_global = true;
+        requested_ = true;      // auto_localize でなくても 1 回は GLOBAL を回す
       }
     }
     RCLCPP_INFO(get_logger(), "%s reject (%s %.2f %.2f)%s",
@@ -511,6 +537,7 @@ private:
   int max_consecutive_rejects_ = 5;
   double max_accept_jump_m_ = 2.0;
   double max_accept_yaw_deg_ = 20.0;
+  double track_max_wfrac_ = 0.35;
   bool use_odometry_ = true;
   bool publish_initialpose_ = true;
   double transform_tolerance_ = 0.2;
@@ -524,7 +551,7 @@ private:
 
   std::mutex mu_;                     ///< last_scan_ / requested_
   std::condition_variable cv_;
-  sensor_msgs::msg::LaserScan::SharedPtr last_scan_;
+  sensor_msgs::msg::LaserScan::SharedPtr pending_scan_;
 
   std::mutex state_mu_;               ///< 追跡状態とオドメトリ
   Pose2D last_pose_, odom_, odom_at_accept_;

@@ -189,6 +189,24 @@ int main()
     check(in_window == static_cast<int>(gts.size()),
       "TRACK が返す解は探索窓の内側にある");
 
+    // 誤ロックの検出に使う量: 事前姿勢に依らないこと。
+    // (跳び判定は事前姿勢からの相対量なので、誤ロックが自分の事前姿勢と整合すると
+    //  検出できない。WFRAC は事前姿勢を一切参照しないのでその役に立つ)
+    {
+      const std::vector<Beam> b =
+        castScan(map, res, ox, oy, gts[0].x, gts[0].y, gts[0].yaw, p.max_range);
+      const std::vector<PoseCandidate> c0 = loc.localize(b);
+      PoseCandidate wrong = c0[0];
+      wrong.x += 4.0;
+      wrong.yaw += 1.0;
+      const double wf_ok = loc.wallMissFraction(c0[0], b);
+      const double wf_ng = loc.wallMissFraction(wrong, b);
+      check(wf_ok < 0.35 && wf_ng > 0.35,
+        "正解姿勢と誤姿勢が既定のしきい値 0.35 で分離する (" +
+        std::to_string(wf_ok).substr(0, 5) + " vs " +
+        std::to_string(wf_ng).substr(0, 5) + ")");
+    }
+
     // 地図の外を事前姿勢に与えたら空を返す
     const std::vector<Beam> beams =
       castScan(map, res, ox, oy, gts[0].x, gts[0].y, gts[0].yaw, p.max_range);

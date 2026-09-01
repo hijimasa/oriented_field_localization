@@ -19,6 +19,9 @@ refinement, no multi-scan accumulation, and no internal odometry.
 | BBS (Olson/Hess branch-and-bound correlative matching) | 62.5% | 0.013 / 0.037 |
 | Radon sinogram method (sibling package, best configuration) | 85.7% | 0.060 / 0.084 |
 
+In a continuous Gazebo drive (240 s, 121 m) it holds a **median error of 0.039 m with 99.7% within
+0.5 m**, and recovers from a kidnap in **0.6 s** ([docs/en/simulation.md](docs/en/simulation.md)).
+
 Success is "position error < 1.0 m and angle error < 15 deg". McNemar against BBS gives
 p = 1.6e-278. **Inside its window, TRACK pulls in regardless of how large the prior error
 is**, and it helps most on the self-similar corridor maps (50.7% -> 84.5%). **Its time does
@@ -116,6 +119,7 @@ Set `auto_localize: true` to run on every incoming scan.
 | `track_angle_window_deg` | `30` | TRACK angle search window `[deg]` |
 | `track_after_accepts` | `3` | consecutive accepts before switching to TRACK |
 | `max_consecutive_rejects` | `5` | consecutive rejects before falling back to GLOBAL |
+| `track_max_wfrac` | `0.35` | reject in TRACK when the fraction of points off the walls exceeds this. **This is what detects a wrong lock** |
 | `use_odometry` | `true` | propagate the prior with `/odom` |
 | `tf_mode` | `none` | `none` / `map_to_odom` (REP-105) / `map_to_base` |
 
@@ -151,6 +155,24 @@ colcon test-result --verbose
 The ROS-independent unit test (19 checks) covers the parameter invariants, recovery of known
 poses, the candidate pool's properties (score ordering, NMS separation, size cap), the sign
 of WFRAC, and TRACK's pull-in and window boundary.
+
+## Continuous-drive validation in Gazebo
+
+Driving the robot inside Gazebo Classic shows what offline cannot: following under drift, recovery
+from a kidnap, and what TRACK contributes.
+
+```bash
+./sim/run_sim.sh out 240
+KIDNAP_AT=120 ./sim/run_sim.sh out_kidnap 240
+```
+
+A single wall definition generates both the world and the occupancy grid, so they cannot disagree.
+Measurements and limits are in [docs/en/simulation.md](docs/en/simulation.md); the setup is
+described in [sim/README.en.md](sim/README.en.md).
+
+**This validation found and fixed a defect: a jump gate cannot detect a wrong lock.** Once the track
+lands somewhere wrong, every subsequent prior comes from that wrong place, so nothing looks like a
+jump. Adding WFRAC — which does not consult the prior — turned "never recovers" into 0.6 s.
 
 ## Evaluation harness
 
@@ -188,6 +210,11 @@ oriented_field_localization/
 ├── launch/global_localization.launch.py
 ├── config/params.yaml
 ├── tests/test_matcher.cpp
+├── sim/                             # continuous-drive validation in Gazebo
+│   ├── make_env.py                  # world, map and route from one wall definition
+│   ├── models/robot.urdf
+│   ├── drive_node.py                # path following (ground truth) and error recording
+│   └── run_sim.sh
 ├── eval/                            # comparison harness against BBS
 │   ├── make_scans.cpp               # pose sampling + disturbed scan generation
 │   ├── ofl_eval.cpp                 # evaluator for this method
@@ -199,6 +226,7 @@ oriented_field_localization/
 └── docs/
     ├── design.md                    # design and known limits
     ├── benchmark.md                 # comparison against BBS / Radon
+    ├── simulation.md                # continuous-drive validation in Gazebo
     └── en/                          # English versions of the above
 ```
 

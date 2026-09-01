@@ -18,6 +18,9 @@
 | BBS (Olson/Hess 型 分枝限定相関) | 62.5% | 0.013 / 0.037 |
 | Radon サイノグラム法 (姉妹パッケージの最良構成) | 85.7% | 0.060 / 0.084 |
 
+Gazebo での連続走行 (240 秒・121 m) では**位置誤差 中央 0.039 m / 0.5 m 以内 99.7%**、
+kidnap から **0.6 秒で復帰**します ([docs/simulation.md](docs/simulation.md))。
+
 成功判定は「位置誤差 < 1.0 m かつ 角度誤差 < 15 度」。McNemar で BBS 比
 p = 1.6e-278。TRACK は**窓の内側なら事前誤差の大きさによらず引き込み**、
 自己相似な廊下地図で最も効きます (50.7% -> 84.5%)。**時間は地図の大きさに
@@ -113,6 +116,7 @@ ros2 service call \
 | `track_angle_window_deg` | `30` | TRACK の角度探索幅 `[deg]` |
 | `track_after_accepts` | `3` | 連続採択がこの回数で TRACK へ移る |
 | `max_consecutive_rejects` | `5` | 連続棄却がこの回数で GLOBAL へ戻る |
+| `track_max_wfrac` | `0.35` | TRACK 中に壁へ載らない点の割合がこれを超えたら棄却。**誤ロックの検出はこれが担う** |
 | `use_odometry` | `true` | `/odom` で事前姿勢を伝播する |
 | `tf_mode` | `none` | `none` / `map_to_odom` (REP-105) / `map_to_base` |
 
@@ -146,6 +150,25 @@ colcon test-result --verbose
 ROS 非依存の単体テスト (19 項目) は、パラメータの不変条件、既知姿勢の復元、候補プールの
 性質 (スコア降順・NMS 分離・上限)、WFRAC の符号、TRACK の引き込みと窓の境界を
 検査します。
+
+## Gazebo での連続走行検証
+
+Gazebo Classic の中でロボットを走らせ、オフラインでは測れないもの (ドリフト下での
+追従、kidnap からの復帰、TRACK の寄与) を見ます。
+
+```bash
+./sim/run_sim.sh out 240
+KIDNAP_AT=120 ./sim/run_sim.sh out_kidnap 240
+```
+
+壁の定義 1 つから world と占有格子の両方を生成するので、world と地図がずれません。
+測定と限界は [docs/simulation.md](docs/simulation.md)、環境の作りは
+[sim/README.md](sim/README.md)。
+
+**この検証で誤ロックを検出できない欠陥が見つかり、修正しました。**跳び判定だけでは、
+いったん誤った場所へ乗ると以後の事前姿勢もそこから出るので「跳んでいない」と見えて
+しまい、原理的に検出できません。事前姿勢に依存しない WFRAC を足して復帰するように
+なりました (復帰せず → 0.6 秒)。
 
 ## 評価ハーネス
 
@@ -182,6 +205,11 @@ oriented_field_localization/
 ├── launch/global_localization.launch.py
 ├── config/params.yaml
 ├── tests/test_matcher.cpp
+├── sim/                             # Gazebo での連続走行検証
+│   ├── make_env.py                  # 壁の定義から world・地図・経路を生成
+│   ├── models/robot.urdf
+│   ├── drive_node.py                # 経路追従 (真値) と誤差記録
+│   └── run_sim.sh
 ├── eval/                            # BBS との比較ハーネス
 │   ├── make_scans.cpp               # 姿勢サンプリング + 外乱スキャン生成
 │   ├── ofl_eval.cpp                 # 本手法の評価器
@@ -193,6 +221,7 @@ oriented_field_localization/
 └── docs/
     ├── design.md                    # 設計と既知の制約
     ├── benchmark.md                 # BBS / Radon との比較
+    ├── simulation.md                # Gazebo での連続走行検証
     └── en/                          # 上記の英語版
 ```
 
