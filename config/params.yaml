@@ -1,0 +1,42 @@
+# oriented_field_localization / ofl_node の既定値。
+# 数値の根拠は docs/benchmark.md (9 地図 x 15 外乱条件 x 40 姿勢)。
+/**:
+  ros__parameters:
+    # ---- 地図 ----
+    map_yaml_path: ""            # 空なら transient_local な /map を待つ
+
+    # ---- 表現 ----
+    match_resolution: 0.05       # マッチング格子 [m/px]
+    max_range: 10.0              # テンプレートに使う最大レンジ [m]
+    min_range: 0.0               # 至近レンジゲート [m]。0 で無効
+    margin_pixels: 284           # 地図外周のゼロパディング [px]。
+                                 # >= ceil(max_range/match_resolution) が必須、
+                                 # >= ceil(sqrt(2)*max_range/match_resolution)+1 で
+                                 # 相関の外挿が 0 になり DFT が最小になる
+    normal_weight: 1.0           # 法線チャネルの重み。0 で壁質量のみ (-1.5 pt)
+    mass_weight: 1.0
+    map_normal_sigma: 3.0        # 地図法線を作る自由空間マスクのぼかし [px]
+
+    # ---- 探索 ----
+    pyramid_levels: 3            # 3 が最良 (2 は 2 倍遅く精度は同等)
+    coarse_angle_step: 6         # [deg]。3 は +0.4 pt で 1.7 倍遅い、9 以上は悪化
+    peaks_per_angle: 8
+    candidate_pool_size: 15
+    intermediate_pool_size: 8
+    refine_angle_window: 2       # [deg]
+    refine_search_m: 0.2         # [m]
+    nms_separation_m: 2.0
+    nms_separation_deg: 15
+
+    # ---- 採択 ----
+    wfrac_margin: 1.05           # 拮抗帯 (top1/top2 < この値) でだけ WFRAC で
+                                 # 選び直す。0 で無効。1.05 は 9 地図で較正した値
+    wfrac_tolerance_m: 0.10
+    global_min_margin: 1.0       # top1/top2 がこれ未満なら publish しない
+                                 # (1.0 = 実質無効。誤 commit を嫌う場合に上げる)
+
+    # ---- 出力 ----
+    auto_localize: false         # true でスキャンごとに自動実行
+    publish_tf: false            # true で map -> base_frame を配信する
+    map_frame: "map"
+    base_frame: "base_link"

@@ -1,0 +1,6 @@
+out/
+out*/
+maps/
+make_scans
+ofl_eval
+bbs_eval
