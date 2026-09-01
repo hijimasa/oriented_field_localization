@@ -1,21 +1,33 @@
 // oriented_field_localization の ROS 2 ノード。
 //
-// **大域位置推定 (GLOBAL) だけを行う。**追跡はしない。1 スキャンから地図座標の
-// 3-DoF 姿勢を求めて /initialpose へ流し、以降の追跡は AMCL などに任せる、という
-// 分担を想定している (CBGL と同じ位置づけ)。オドメトリ・状態機械・ICP 精密化は
-// 持たない。
+// GLOBAL (地図全域の探索) と TRACK (事前姿勢の周りの局所探索) を状態機械で
+// 切り替える。
+//
+//   GLOBAL --- track_after_accepts 回連続で採択 ---> TRACK
+//   TRACK  --- max_consecutive_rejects 回連続で棄却 ---> GLOBAL
+//
+// TRACK の事前姿勢は「最後に採択した地図姿勢 + それ以降のオドメトリ差分」で、
+// オドメトリが無い場合は最後の採択姿勢をそのまま使う (スキャン間の移動が
+// track_search_m に収まる前提)。
 //
 // トピック:
-//   subscribe  /scan  sensor_msgs/LaserScan
-//              /map   nav_msgs/OccupancyGrid   (map_yaml_path 未指定のとき)
-//   publish    /initialpose            geometry_msgs/PoseWithCovarianceStamped
-//              ~/candidates            geometry_msgs/PoseArray  (可視化・診断)
-//   service    ~/global_localization   std_srvs/Empty           (探索の開始)
+//   subscribe  scan   sensor_msgs/LaserScan
+//              map    nav_msgs/OccupancyGrid   (map_yaml_path 未指定のとき)
+//              odom   nav_msgs/Odometry        (use_odometry のとき)
+//   publish    ~/pose                  geometry_msgs/PoseWithCovarianceStamped
+//              /initialpose            同上 (GLOBAL からの引き継ぎ時のみ)
+//              ~/candidates            geometry_msgs/PoseArray
+//   service    ~/global_localization   std_srvs/Empty   (GLOBAL 探索の強制)
+//
+// TF は REP-105 に従う。位置推定が出すのは map -> odom であって map -> base_link
+// ではない (T_map_odom = T_map_base * T_odom_base^-1)。odom を出すノードが居ない
+// 構成のために tf_mode: map_to_base も用意してある。
 #include "oriented_field_localization/oriented_field_matcher.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
+#include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -23,6 +35,7 @@
 #include <tf2_ros/transform_broadcaster.h>
 
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <fstream>
 #include <memory>
@@ -35,6 +48,61 @@ using oriented_field_localization::Beam;
 using oriented_field_localization::MatcherParams;
 using oriented_field_localization::OrientedFieldLocalizer;
 using oriented_field_localization::PoseCandidate;
+
+namespace
+{
+/// 2D 姿勢 (地図 or オドメトリ座標)。
+struct Pose2D
+{
+  double x = 0, y = 0, yaw = 0;
+};
+
+double wrapPi(double a)
+{
+  while (a > M_PI) a -= 2 * M_PI;
+  while (a < -M_PI) a += 2 * M_PI;
+  return a;
+}
+
+double yawOf(const geometry_msgs::msg::Quaternion & q)
+{
+  return std::atan2(2.0 * (q.w * q.z + q.x * q.y),
+           1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+}
+
+/// b を a の座標系から見た相対姿勢 (a^-1 * b)。
+Pose2D relative(const Pose2D & a, const Pose2D & b)
+{
+  const double c = std::cos(a.yaw), s = std::sin(a.yaw);
+  const double dx = b.x - a.x, dy = b.y - a.y;
+  return {c * dx + s * dy, -s * dx + c * dy, wrapPi(b.yaw - a.yaw)};
+}
+
+/// a に相対姿勢 d を掛ける (a * d)。
+Pose2D compose(const Pose2D & a, const Pose2D & d)
+{
+  const double c = std::cos(a.yaw), s = std::sin(a.yaw);
+  return {a.x + c * d.x - s * d.y, a.y + s * d.x + c * d.y, wrapPi(a.yaw + d.yaw)};
+}
+
+/// a^-1 (2D 剛体変換の逆)。
+Pose2D inverse(const Pose2D & a)
+{
+  const double c = std::cos(a.yaw), s = std::sin(a.yaw);
+  return {-(c * a.x + s * a.y), -(-s * a.x + c * a.y), wrapPi(-a.yaw)};
+}
+
+geometry_msgs::msg::Quaternion yawQuat(double yaw)
+{
+  geometry_msgs::msg::Quaternion q;
+  q.z = std::sin(yaw / 2.0);
+  q.w = std::cos(yaw / 2.0);
+  return q;
+}
+
+enum class TfMode { None, MapToOdom, MapToBase };
+
+}  // namespace
 
 class OflNode : public rclcpp::Node
 {
@@ -61,13 +129,27 @@ public:
     p.mass_weight = declare_parameter("mass_weight", p.mass_weight);
     p.map_normal_sigma = declare_parameter("map_normal_sigma", p.map_normal_sigma);
     p.wfrac_tolerance_m = declare_parameter("wfrac_tolerance_m", p.wfrac_tolerance_m);
+    p.track_search_m = declare_parameter("track_search_m", p.track_search_m);
+    p.track_angle_window_deg =
+      declare_parameter("track_angle_window_deg", p.track_angle_window_deg);
 
     wfrac_margin_ = declare_parameter("wfrac_margin", 1.05);
     global_min_margin_ = declare_parameter("global_min_margin", 1.0);
     auto_localize_ = declare_parameter("auto_localize", false);
-    publish_tf_ = declare_parameter("publish_tf", false);
+    enable_track_ = declare_parameter("enable_track", true);
+    track_after_accepts_ = declare_parameter("track_after_accepts", 3);
+    max_consecutive_rejects_ = declare_parameter("max_consecutive_rejects", 5);
+    max_accept_jump_m_ = declare_parameter("max_accept_jump_m", 2.0);
+    max_accept_yaw_deg_ = declare_parameter("max_accept_yaw_deg", 20.0);
+    use_odometry_ = declare_parameter("use_odometry", true);
+    publish_initialpose_ = declare_parameter("publish_initialpose", true);
     map_frame_ = declare_parameter("map_frame", std::string("map"));
+    odom_frame_ = declare_parameter("odom_frame", std::string("odom"));
     base_frame_ = declare_parameter("base_frame", std::string("base_link"));
+    transform_tolerance_ = declare_parameter("transform_tolerance", 0.2);
+    const std::string tf_mode = declare_parameter("tf_mode", std::string("none"));
+    tf_mode_ = tf_mode == "map_to_odom" ? TfMode::MapToOdom
+      : tf_mode == "map_to_base" ? TfMode::MapToBase : TfMode::None;
     const std::string map_yaml = declare_parameter("map_yaml_path", std::string(""));
 
     // margin は「テンプレートが地図の縁で切れない」ための下限を満たす必要がある。
@@ -83,6 +165,11 @@ public:
         "margin_pixels %d < recommended %d; the correlation pads by %d px extra",
         p.margin_pixels, p.recommendedMargin(), p.recommendedMargin() - p.margin_pixels);
     }
+    if (tf_mode_ == TfMode::MapToOdom && !use_odometry_) {
+      RCLCPP_WARN(get_logger(),
+        "tf_mode=map_to_odom needs use_odometry; falling back to map_to_base");
+      tf_mode_ = TfMode::MapToBase;
+    }
 
     localizer_ = std::make_unique<OrientedFieldLocalizer>(p);
 
@@ -90,6 +177,11 @@ public:
     scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
       "scan", sensor_qos,
       [this](sensor_msgs::msg::LaserScan::SharedPtr msg) {onScan(msg);});
+    if (use_odometry_) {
+      odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+        "odom", sensor_qos,
+        [this](nav_msgs::msg::Odometry::SharedPtr msg) {onOdom(msg);});
+    }
 
     if (map_yaml.empty()) {
       auto map_qos = rclcpp::QoS(1).transient_local().reliable();
@@ -101,22 +193,31 @@ public:
       loadMapFromYaml(map_yaml);
     }
 
-    pose_pub_ = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
+    pose_pub_ = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("~/pose", 10);
+    initialpose_pub_ = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
       "/initialpose", 10);
     candidates_pub_ = create_publisher<geometry_msgs::msg::PoseArray>("~/candidates", 10);
-    if (publish_tf_) tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+    if (tf_mode_ != TfMode::None) {
+      tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+    }
 
     service_ = create_service<std_srvs::srv::Empty>(
       "~/global_localization",
       [this](const std::shared_ptr<std_srvs::srv::Empty::Request>,
       std::shared_ptr<std_srvs::srv::Empty::Response>) {
+        // 明示的な要求は追跡状態を捨てて GLOBAL からやり直す (kidnap 対応)
+        std::lock_guard<std::mutex> lk(state_mu_);
+        has_pose_ = false;
+        consecutive_accepts_ = 0;
+        consecutive_rejects_ = 0;
         requested_ = true;
         cv_.notify_one();
       });
 
     worker_ = std::thread(&OflNode::workerLoop, this);
-    RCLCPP_INFO(get_logger(),
-      "ready: call ~/global_localization%s", auto_localize_ ? " (auto_localize on)" : "");
+    RCLCPP_INFO(get_logger(), "ready (%s, TRACK %s, odometry %s)",
+      auto_localize_ ? "auto_localize" : "call ~/global_localization",
+      enable_track_ ? "on" : "off", use_odometry_ ? "on" : "off");
   }
 
   ~OflNode() override
@@ -143,9 +244,9 @@ private:
       } else if (line.find("resolution:") != std::string::npos) {
         resolution = std::stod(line.substr(line.find(':') + 2));
       } else if (line.find("origin:") != std::string::npos) {
-        auto b = line.find('[');
-        auto c1 = line.find(',', b);
-        auto c2 = line.find(',', c1 + 1);
+        const auto b = line.find('[');
+        const auto c1 = line.find(',', b);
+        const auto c2 = line.find(',', c1 + 1);
         ox = std::stod(line.substr(b + 1, c1 - b - 1));
         oy = std::stod(line.substr(c1 + 1, c2 - c1 - 1));
       }
@@ -186,6 +287,14 @@ private:
       img.cols, img.rows, res, (now() - t0).seconds());
   }
 
+  void onOdom(const nav_msgs::msg::Odometry::SharedPtr msg)
+  {
+    std::lock_guard<std::mutex> lk(state_mu_);
+    odom_ = {msg->pose.pose.position.x, msg->pose.pose.position.y,
+      yawOf(msg->pose.pose.orientation)};
+    has_odom_ = true;
+  }
+
   void onScan(const sensor_msgs::msg::LaserScan::SharedPtr msg)
   {
     {
@@ -196,8 +305,7 @@ private:
     cv_.notify_one();
   }
 
-  static std::vector<Beam> toBeams(
-    const sensor_msgs::msg::LaserScan & s, double max_range)
+  static std::vector<Beam> toBeams(const sensor_msgs::msg::LaserScan & s, double max_range)
   {
     std::vector<Beam> beams;
     beams.reserve(s.ranges.size());
@@ -219,68 +327,163 @@ private:
         cv_.wait(lk, [this] {return stop_ || (requested_ && last_scan_ && map_ready_);});
         if (stop_) return;
         scan = last_scan_;
-        requested_ = false;
+        // TRACK 中はスキャンごとに走り続ける。GLOBAL はサービス要求ごと
+        // (auto_localize なら毎スキャン)。
+        if (!(auto_localize_ || tracking_)) requested_ = false;
       }
       if (!scan) continue;
 
       const std::vector<Beam> beams = toBeams(*scan, localizer_->params().max_range);
       if (beams.size() < 8) {
-        RCLCPP_WARN(get_logger(), "too few valid beams (%zu); skipping", beams.size());
-        continue;
-      }
-      const auto t0 = now();
-      std::vector<PoseCandidate> cands = localizer_->localize(beams);
-      const double dt = (now() - t0).seconds();
-      if (cands.empty()) {
-        RCLCPP_WARN(get_logger(), "no candidate found");
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "too few valid beams (%zu); skipping", beams.size());
         continue;
       }
 
-      // 拮抗帯だけ WFRAC (スキャン点が地図壁から外れる割合) で選び直す
+      // 事前姿勢: 最後の採択姿勢 + それ以降のオドメトリ差分
+      Pose2D prior;
+      Pose2D odom_now;
+      bool have_prior = false;
+      {
+        std::lock_guard<std::mutex> lk(state_mu_);
+        odom_now = odom_;
+        if (has_pose_) {
+          prior = last_pose_;
+          if (use_odometry_ && has_odom_ && had_odom_at_accept_) {
+            prior = compose(last_pose_, relative(odom_at_accept_, odom_));
+          }
+          have_prior = true;
+        }
+      }
+      const bool use_track = enable_track_ && tracking_ && have_prior;
+
+      const auto t0 = now();
+      std::vector<PoseCandidate> cands;
+      if (use_track) {
+        PoseCandidate pr;
+        pr.x = prior.x; pr.y = prior.y; pr.yaw = prior.yaw;
+        cands = localizer_->track(beams, pr);
+      } else {
+        cands = localizer_->localize(beams);
+      }
+      const double dt = (now() - t0).seconds();
+
+      if (cands.empty()) {
+        onReject("no candidate", use_track);
+        continue;
+      }
+      publishCandidates(cands, scan->header.stamp);
+
       int pick = 0;
       if (wfrac_margin_ > 0) pick = localizer_->wfracGateSelect(cands, beams, wfrac_margin_);
       const PoseCandidate & best = cands[pick];
       const double margin = (cands.size() > 1 && cands[1].score > 0)
         ? cands[0].score / cands[1].score : 1e9;
 
-      publishCandidates(cands, scan->header.stamp);
-      if (margin < global_min_margin_) {
-        RCLCPP_INFO(get_logger(),
-          "rejected: top1/top2 margin %.2f < %.2f (%.0f ms, %zu candidates)",
-          margin, global_min_margin_, 1e3 * dt, cands.size());
+      if (use_track) {
+        // 事前姿勢からの跳びで採否を決める (TRACK の窓は広いので、窓の中でも
+        // 遠くへ飛んだ解は単発の誤マッチとみなして捨てる)
+        const double dpos = std::hypot(best.x - prior.x, best.y - prior.y);
+        const double dyaw = std::fabs(wrapPi(best.yaw - prior.yaw)) * 180.0 / M_PI;
+        if ((max_accept_jump_m_ > 0 && dpos > max_accept_jump_m_) ||
+          (max_accept_yaw_deg_ > 0 && dyaw > max_accept_yaw_deg_))
+        {
+          onReject("jump", true, dpos, dyaw);
+          continue;
+        }
+      } else if (margin < global_min_margin_) {
+        onReject("margin", false, margin);
         continue;
       }
-      publishPose(best, scan->header.stamp);
-      RCLCPP_INFO(get_logger(),
-        "accepted (%.2f, %.2f, %.1f deg) score %.4f margin %.2f in %.0f ms",
-        best.x, best.y, best.yaw * 180.0 / M_PI, best.score, margin, 1e3 * dt);
+
+      onAccept(best, odom_now, scan->header.stamp, use_track, margin, dt, cands.size());
     }
   }
 
-  void publishPose(const PoseCandidate & c, const rclcpp::Time & stamp)
+  void onAccept(
+    const PoseCandidate & best, const Pose2D & odom_now, const rclcpp::Time & stamp,
+    bool was_track, double margin, double dt, size_t n_cands)
+  {
+    bool became_track = false;
+    bool first_lock = false;
+    {
+      std::lock_guard<std::mutex> lk(state_mu_);
+      first_lock = !has_pose_;
+      last_pose_ = {best.x, best.y, best.yaw};
+      has_pose_ = true;
+      odom_at_accept_ = odom_now;
+      had_odom_at_accept_ = has_odom_;
+      consecutive_rejects_ = 0;
+      consecutive_accepts_++;
+      if (enable_track_ && !tracking_ && consecutive_accepts_ >= track_after_accepts_) {
+        tracking_ = true;
+        became_track = true;
+      }
+    }
+    publishPose(best, odom_now, stamp, /*also_initialpose=*/!was_track && first_lock);
+    RCLCPP_INFO(get_logger(),
+      "%s accept (%.2f, %.2f, %.1f deg) score %.4f margin %.2f in %.0f ms (%zu cands)%s",
+      was_track ? "TRACK" : "GLOBAL", best.x, best.y, best.yaw * 180.0 / M_PI,
+      best.score, margin, 1e3 * dt, n_cands, became_track ? " -> TRACK" : "");
+  }
+
+  void onReject(const char * why, bool was_track, double a = 0, double b = 0)
+  {
+    bool back_to_global = false;
+    {
+      std::lock_guard<std::mutex> lk(state_mu_);
+      consecutive_accepts_ = 0;
+      consecutive_rejects_++;
+      if (tracking_ && consecutive_rejects_ >= max_consecutive_rejects_) {
+        tracking_ = false;
+        has_pose_ = false;      // 追跡喪失: 事前姿勢を捨てて GLOBAL から取り直す
+        consecutive_rejects_ = 0;
+        back_to_global = true;
+      }
+    }
+    RCLCPP_INFO(get_logger(), "%s reject (%s %.2f %.2f)%s",
+      was_track ? "TRACK" : "GLOBAL", why, a, b,
+      back_to_global ? " -> GLOBAL" : "");
+  }
+
+  void publishPose(
+    const PoseCandidate & c, const Pose2D & odom_now, const rclcpp::Time & stamp,
+    bool also_initialpose)
   {
     geometry_msgs::msg::PoseWithCovarianceStamped m;
     m.header.stamp = stamp;
     m.header.frame_id = map_frame_;
     m.pose.pose.position.x = c.x;
     m.pose.pose.position.y = c.y;
-    m.pose.pose.orientation.z = std::sin(c.yaw / 2.0);
-    m.pose.pose.orientation.w = std::cos(c.yaw / 2.0);
+    m.pose.pose.orientation = yawQuat(c.yaw);
     m.pose.covariance[0] = 0.25;
     m.pose.covariance[7] = 0.25;
     m.pose.covariance[35] = 0.07;
     pose_pub_->publish(m);
+    if (also_initialpose && publish_initialpose_) initialpose_pub_->publish(m);
 
-    if (tf_broadcaster_) {
-      geometry_msgs::msg::TransformStamped tf;
-      tf.header.stamp = stamp;
+    if (!tf_broadcaster_) return;
+    const rclcpp::Time tf_stamp =
+      stamp + rclcpp::Duration::from_seconds(transform_tolerance_);
+    geometry_msgs::msg::TransformStamped tf;
+    tf.header.stamp = tf_stamp;
+    if (tf_mode_ == TfMode::MapToOdom) {
+      // REP-105: 位置推定が出すのは map -> odom。
+      //   T_map_base = T_map_odom * T_odom_base  =>  T_map_odom = T_map_base * T_odom_base^-1
+      const Pose2D map_odom = compose({c.x, c.y, c.yaw}, inverse(odom_now));
+      tf.header.frame_id = map_frame_;
+      tf.child_frame_id = odom_frame_;
+      tf.transform.translation.x = map_odom.x;
+      tf.transform.translation.y = map_odom.y;
+      tf.transform.rotation = yawQuat(map_odom.yaw);
+    } else {
       tf.header.frame_id = map_frame_;
       tf.child_frame_id = base_frame_;
       tf.transform.translation.x = c.x;
       tf.transform.translation.y = c.y;
-      tf.transform.rotation = m.pose.pose.orientation;
-      tf_broadcaster_->sendTransform(tf);
+      tf.transform.rotation = yawQuat(c.yaw);
     }
+    tf_broadcaster_->sendTransform(tf);
   }
 
   void publishCandidates(
@@ -293,8 +496,7 @@ private:
       geometry_msgs::msg::Pose q;
       q.position.x = c.x;
       q.position.y = c.y;
-      q.orientation.z = std::sin(c.yaw / 2.0);
-      q.orientation.w = std::cos(c.yaw / 2.0);
+      q.orientation = yawQuat(c.yaw);
       arr.poses.push_back(q);
     }
     candidates_pub_->publish(arr);
@@ -304,20 +506,37 @@ private:
   double wfrac_margin_ = 1.05;
   double global_min_margin_ = 1.0;
   bool auto_localize_ = false;
-  bool publish_tf_ = false;
-  std::string map_frame_, base_frame_;
+  bool enable_track_ = true;
+  int track_after_accepts_ = 3;
+  int max_consecutive_rejects_ = 5;
+  double max_accept_jump_m_ = 2.0;
+  double max_accept_yaw_deg_ = 20.0;
+  bool use_odometry_ = true;
+  bool publish_initialpose_ = true;
+  double transform_tolerance_ = 0.2;
+  TfMode tf_mode_ = TfMode::None;
+  std::string map_frame_, odom_frame_, base_frame_;
 
   std::atomic<bool> map_ready_{false};
   std::atomic<bool> requested_{false};
   std::atomic<bool> stop_{false};
-  std::mutex mu_;
+  std::atomic<bool> tracking_{false};
+
+  std::mutex mu_;                     ///< last_scan_ / requested_
   std::condition_variable cv_;
   sensor_msgs::msg::LaserScan::SharedPtr last_scan_;
-  std::thread worker_;
 
+  std::mutex state_mu_;               ///< 追跡状態とオドメトリ
+  Pose2D last_pose_, odom_, odom_at_accept_;
+  bool has_pose_ = false, has_odom_ = false, had_odom_at_accept_ = false;
+  int consecutive_accepts_ = 0, consecutive_rejects_ = 0;
+
+  std::thread worker_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initialpose_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr candidates_pub_;
   rclcpp::Service<std_srvs::srv::Empty>::SharedPtr service_;
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;

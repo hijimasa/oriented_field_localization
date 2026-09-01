@@ -11,10 +11,19 @@
 //   OFL_ANGLE_STEP, OFL_PEAKS, OFL_POOL, OFL_LAMBDA, OFL_WFRAC_MARGIN,
 //   OFL_STAGEDUMP=1  段階別の所要時間を stderr へ出す
 //   OFL_CANDDUMP=<csv>  候補プールを (score, wfrac, 誤差) ごと書き出す
+//
+// TRACK (局所探索) の評価:
+//   OFL_TRACK=1        真姿勢を乱数で崩した事前姿勢を与えて track() を呼ぶ。
+//                      オドメトリ予測が持つ誤差を模した設定で、GLOBAL と同じ
+//                      スキャン集合の上で局所探索の引き込み範囲と精度を測る。
+//   OFL_TRACK_POS=1.0  事前姿勢の位置誤差の上限 [m] (円内一様)
+//   OFL_TRACK_YAW=10   事前姿勢の角度誤差の上限 [deg] (一様)
+//   乱数は (条件, 試行) から決まるので、同じ設定なら常に同じ事前姿勢になる。
 #include "oriented_field_localization/oriented_field_matcher.hpp"
 
 #include <chrono>
 #include <cmath>
+#include <random>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -54,6 +63,11 @@ int main(int argc, char ** argv)
   p.normal_weight = envD("OFL_LAMBDA", 1.0);
   const double wfrac_margin = envD("OFL_WFRAC_MARGIN", 1.05);
   const bool stage_dump = envI("OFL_STAGEDUMP", 0) != 0;
+  p.track_search_m = envD("OFL_TRACK_SEARCH_M", p.track_search_m);
+  p.track_angle_window_deg = envI("OFL_TRACK_ANGLE_DEG", p.track_angle_window_deg);
+  const bool track_mode = envI("OFL_TRACK", 0) != 0;
+  const double track_pos = envD("OFL_TRACK_POS", 1.0);
+  const double track_yaw = envD("OFL_TRACK_YAW", 10.0) * M_PI / 180.0;
 
   FILE * cand_dump = nullptr;
   if (const char * e = getenv("OFL_CANDDUMP")) {
@@ -76,6 +90,11 @@ int main(int argc, char ** argv)
     p.match_resolution, p.margin_pixels, p.minimumMargin(), p.recommendedMargin(),
     p.pyramid_levels, p.coarse_angle_step, p.peaks_per_angle, p.candidate_pool_size,
     p.normal_weight, wfrac_margin, p.min_range);
+  if (track_mode) {
+    fprintf(stderr, "TRACK mode: prior error <= %.2f m / %.1f deg, "
+      "search +-%.1f m / +-%d deg\n", track_pos, track_yaw * 180.0 / M_PI,
+      p.track_search_m, p.track_angle_window_deg);
+  }
   fprintf(stderr, "map init: %.2fs\n",
     std::chrono::duration<double>(t_init1 - t_init0).count());
 
@@ -111,8 +130,21 @@ int main(int argc, char ** argv)
     double gt_deg = gth * 180.0 / M_PI;
     while (gt_deg < 0) gt_deg += 360.0;
 
+    // TRACK 評価では真姿勢を崩した事前姿勢を与える (オドメトリ誤差の模擬)
+    PoseCandidate prior;
+    if (track_mode) {
+      std::mt19937 rng(1469598103u ^ (std::hash<std::string>{}(cond) * 31u + trial));
+      std::uniform_real_distribution<double> u01(0.0, 1.0);
+      const double r = track_pos * std::sqrt(u01(rng));
+      const double a = 2 * M_PI * u01(rng);
+      prior.x = gx + r * std::cos(a);
+      prior.y = gy + r * std::sin(a);
+      prior.yaw = gth + (2 * u01(rng) - 1) * track_yaw;
+    }
+
     auto ts = std::chrono::steady_clock::now();
-    std::vector<PoseCandidate> cands = loc.localize(beams);
+    std::vector<PoseCandidate> cands =
+      track_mode ? loc.track(beams, prior) : loc.localize(beams);
     auto te = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(te - ts).count();
 

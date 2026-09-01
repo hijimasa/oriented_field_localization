@@ -6,20 +6,22 @@
 単位法線) の FFT 相関**として照合し、地図座標の 3-DoF 姿勢 `(x, y, yaw)` を
 **1 スキャンから初期位置なしで**推定する ROS 2 パッケージです。
 
-**大域位置推定 (GLOBAL) だけを行います。**求めた姿勢を `/initialpose` へ流し、以降の
-追跡は AMCL などに任せる分担を想定しています (CBGL と同じ位置づけ)。オドメトリ・
-状態機械・ICP 精密化は持ちません。
+初期化・再初期化時は地図全体を探索し (GLOBAL)、収束後は事前姿勢の周りを局所探索で
+追い続けます (TRACK)。ICP 精密化・複数スキャン累積・内部オドメトリは持ちません。
 
 ## 成績 (9 地図 x 15 外乱条件 x 40 姿勢 = 5400 試行)
 
 | 手法 | 成功率 | 1 スキャンあたり [s] |
 |---|---:|---:|
-| **本手法** | **86.9%** | **0.010** (30x30 m 地図) / 0.025 (52x50 m) |
+| **本手法 GLOBAL** | **86.9%** | **0.010** (30x30 m 地図) / 0.025 (52x50 m) |
+| **本手法 TRACK** (事前誤差 <= 3 m / 30 度) | **96.6%** | **0.005** / 0.005 |
 | BBS (Olson/Hess 型 分枝限定相関) | 62.5% | 0.013 / 0.037 |
 | Radon サイノグラム法 (姉妹パッケージの最良構成) | 85.7% | 0.060 / 0.084 |
 
 成功判定は「位置誤差 < 1.0 m かつ 角度誤差 < 15 度」。McNemar で BBS 比
-p = 1.6e-278。条件・地図別の内訳と限界は
+p = 1.6e-278。TRACK は**窓の内側なら事前誤差の大きさによらず引き込み**、
+自己相似な廊下地図で最も効きます (50.7% -> 84.5%)。**時間は地図の大きさに
+依存しません**。条件・地図別の内訳と限界は
 **[docs/benchmark.md](docs/benchmark.md)** にあります。
 
 **BBS には探索の完全性の保証があり、本手法にはありません。**それでも差が付くのは
@@ -83,10 +85,12 @@ ros2 service call \
 |---|---|---|---|
 | subscribe | `scan` | `sensor_msgs/msg/LaserScan` | 2D LiDAR スキャン |
 | subscribe | `map` | `nav_msgs/msg/OccupancyGrid` | `map_yaml_path` 未指定時 |
-| publish | `/initialpose` | `geometry_msgs/msg/PoseWithCovarianceStamped` | 採択した姿勢 |
+| subscribe | `odom` | `nav_msgs/msg/Odometry` | `use_odometry: true` のとき |
+| publish | `~/pose` | `geometry_msgs/msg/PoseWithCovarianceStamped` | 採択した姿勢 (毎回) |
+| publish | `/initialpose` | 同上 | GLOBAL から初めて採択したときだけ (AMCL への引き継ぎ) |
 | publish | `~/candidates` | `geometry_msgs/msg/PoseArray` | 候補の可視化・診断 |
-| service | `~/global_localization` | `std_srvs/srv/Empty` | 探索の開始 |
-| TF | `map -> base_frame` | TF2 | `publish_tf: true` のときだけ |
+| service | `~/global_localization` | `std_srvs/srv/Empty` | 追跡を捨てて GLOBAL からやり直す |
+| TF | `map -> odom` または `map -> base_frame` | TF2 | `tf_mode` で選択 |
 
 ## 主要パラメータ
 
@@ -104,6 +108,13 @@ ros2 service call \
 | `candidate_pool_size` | `15` | 残す候補数 |
 | `wfrac_margin` | `1.05` | 拮抗時に WFRAC で選び直す比率。0 で無効 |
 | `global_min_margin` | `1.0` | top1/top2 がこれ未満なら publish しない |
+| `enable_track` | `true` | false で常に GLOBAL |
+| `track_search_m` | `3.0` | TRACK の位置探索半径 `[m]` |
+| `track_angle_window_deg` | `30` | TRACK の角度探索幅 `[deg]` |
+| `track_after_accepts` | `3` | 連続採択がこの回数で TRACK へ移る |
+| `max_consecutive_rejects` | `5` | 連続棄却がこの回数で GLOBAL へ戻る |
+| `use_odometry` | `true` | `/odom` で事前姿勢を伝播する |
+| `tf_mode` | `none` | `none` / `map_to_odom` (REP-105) / `map_to_base` |
 
 重要な不変条件:
 
@@ -132,8 +143,9 @@ colcon test --packages-select oriented_field_localization
 colcon test-result --verbose
 ```
 
-ROS 非依存の単体テストは、パラメータの不変条件、既知姿勢の復元、候補プールの性質
-(スコア降順・NMS 分離・上限)、WFRAC の符号を検査します。
+ROS 非依存の単体テスト (19 項目) は、パラメータの不変条件、既知姿勢の復元、候補プールの
+性質 (スコア降順・NMS 分離・上限)、WFRAC の符号、TRACK の引き込みと窓の境界を
+検査します。
 
 ## 評価ハーネス
 
@@ -155,9 +167,9 @@ cd eval && ./run_compare.sh out 40
 ため独立させたものです。経緯・機構の分析・撤回した仮説は
 `radon_global_localization/docs/image_space_control.md` に記録されています。
 
-なお `radon_global_localization` は TRACK (追跡)、オドメトリ、PLICP 精密化、状態機械を
-持つ**連続運用向けの完成したパッケージ**です。本パッケージは大域探索のみなので、
-用途が重なるわけではありません。
+なお `radon_global_localization` は PLICP 精密化・内部オドメトリ (scan-to-scan ICP)・
+複数スキャン累積まで持つ**より作り込まれたパッケージ**です。本パッケージは GLOBAL と
+TRACK の探索そのものに絞ってあります。
 
 ## 構成
 

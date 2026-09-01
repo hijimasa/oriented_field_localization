@@ -6,20 +6,23 @@ A ROS 2 package that localizes a 2D LiDAR scan against an occupancy grid by **FF
 correlation of an oriented field (wall mass + sensor-facing unit normals) in image space**,
 recovering the 3-DoF map pose `(x, y, yaw)` **from a single scan with no initial guess**.
 
-**It does global localization only.** The pose is published on `/initialpose`, and tracking
-is left to AMCL or similar (the same division of labour as CBGL). There is no odometry, no
-state machine, and no ICP refinement.
+It searches the whole map on initialisation and re-initialisation (GLOBAL), then follows
+the pose with a local search around a prior once converged (TRACK). There is no ICP
+refinement, no multi-scan accumulation, and no internal odometry.
 
 ## Results (9 maps x 15 disturbance conditions x 40 poses = 5400 trials)
 
 | Method | Success | Per scan [s] |
 |---|---:|---:|
-| **This package** | **86.9%** | **0.010** (30x30 m map) / 0.025 (52x50 m) |
+| **This package, GLOBAL** | **86.9%** | **0.010** (30x30 m map) / 0.025 (52x50 m) |
+| **This package, TRACK** (prior error <= 3 m / 30 deg) | **96.6%** | **0.005** / 0.005 |
 | BBS (Olson/Hess branch-and-bound correlative matching) | 62.5% | 0.013 / 0.037 |
 | Radon sinogram method (sibling package, best configuration) | 85.7% | 0.060 / 0.084 |
 
 Success is "position error < 1.0 m and angle error < 15 deg". McNemar against BBS gives
-p = 1.6e-278. The per-map and per-condition breakdown, and the limits, are in
+p = 1.6e-278. **Inside its window, TRACK pulls in regardless of how large the prior error
+is**, and it helps most on the self-similar corridor maps (50.7% -> 84.5%). **Its time does
+not depend on the map size.** The per-map and per-condition breakdown, and the limits, are in
 **[docs/benchmark.md](docs/benchmark.md)**.
 
 **BBS has a completeness guarantee and this method does not.** The gap is therefore not
@@ -85,10 +88,12 @@ Set `auto_localize: true` to run on every incoming scan.
 |---|---|---|---|
 | subscribe | `scan` | `sensor_msgs/msg/LaserScan` | 2D LiDAR scan |
 | subscribe | `map` | `nav_msgs/msg/OccupancyGrid` | when `map_yaml_path` is unset |
-| publish | `/initialpose` | `geometry_msgs/msg/PoseWithCovarianceStamped` | accepted pose |
+| subscribe | `odom` | `nav_msgs/msg/Odometry` | when `use_odometry: true` |
+| publish | `~/pose` | `geometry_msgs/msg/PoseWithCovarianceStamped` | accepted pose (every time) |
+| publish | `/initialpose` | as above | only on the first accept out of GLOBAL (handoff to AMCL) |
 | publish | `~/candidates` | `geometry_msgs/msg/PoseArray` | candidates, for RViz / diagnosis |
-| service | `~/global_localization` | `std_srvs/srv/Empty` | start a search |
-| TF | `map -> base_frame` | TF2 | only when `publish_tf: true` |
+| service | `~/global_localization` | `std_srvs/srv/Empty` | drop tracking and restart from GLOBAL |
+| TF | `map -> odom` or `map -> base_frame` | TF2 | selected by `tf_mode` |
 
 ## Key parameters
 
@@ -106,6 +111,13 @@ Set `auto_localize: true` to run on every incoming scan.
 | `candidate_pool_size` | `15` | candidates retained |
 | `wfrac_margin` | `1.05` | re-select by WFRAC only when scores are this close; 0 disables |
 | `global_min_margin` | `1.0` | do not publish if top1/top2 is below this |
+| `enable_track` | `true` | false stays in GLOBAL forever |
+| `track_search_m` | `3.0` | TRACK position search radius `[m]` |
+| `track_angle_window_deg` | `30` | TRACK angle search window `[deg]` |
+| `track_after_accepts` | `3` | consecutive accepts before switching to TRACK |
+| `max_consecutive_rejects` | `5` | consecutive rejects before falling back to GLOBAL |
+| `use_odometry` | `true` | propagate the prior with `/odom` |
+| `tf_mode` | `none` | `none` / `map_to_odom` (REP-105) / `map_to_base` |
 
 Important invariants:
 
@@ -136,9 +148,9 @@ colcon test --packages-select oriented_field_localization
 colcon test-result --verbose
 ```
 
-The ROS-independent unit test checks the parameter invariants, recovery of known poses,
-the candidate pool's properties (score ordering, NMS separation, size cap), and the sign of
-WFRAC.
+The ROS-independent unit test (19 checks) covers the parameter invariants, recovery of known
+poses, the candidate pool's properties (score ordering, NMS separation, size cap), the sign
+of WFRAC, and TRACK's pull-in and window boundary.
 
 ## Evaluation harness
 
@@ -161,9 +173,9 @@ put it ahead on both success rate and speed. The history, the mechanism, and the
 that were retracted are recorded in
 `radon_global_localization/docs/image_space_control.md`.
 
-Note that `radon_global_localization` is a **complete package for continuous operation**,
-with tracking, odometry, PLICP refinement, and a state machine. This package only does the
-global search, so they do not simply substitute for one another.
+Note that `radon_global_localization` is a **more built-out package**, with PLICP
+refinement, internal scan-to-scan odometry, and multi-scan accumulation. This package
+focuses on the GLOBAL and TRACK searches themselves.
 
 ## Layout
 

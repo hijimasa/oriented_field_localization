@@ -86,6 +86,35 @@ i.e. it is set in BBS's favour.
 The package default is `min_range: 0.0`, because 0.8 m is a robot-size-dependent value and
 cutting it uniformly on a small platform throws away real information.
 
+### TRACK (local search)
+
+The local search used after convergence, measured on the same 5400 scans by giving it a
+**prior perturbed at random from ground truth** (a stand-in for odometry error).
+
+| Map | GLOBAL | TRACK (prior error <= 1 m / 10 deg) | TRACK (<= 3 m / 30 deg) | GLOBAL [ms] | TRACK [ms] |
+|---|---:|---:|---:|---:|---:|
+| synthetic_s7 | 94.5% | **100.0%** | **100.0%** | 9.6 | 4.6 |
+| synthetic_s11 | 91.7% | **100.0%** | **100.0%** | 9.6 | 4.5 |
+| synthetic_s23 | 93.2% | **100.0%** | **100.0%** | 9.6 | 4.4 |
+| synthetic_s42 | 96.8% | **100.0%** | **100.0%** | 9.8 | 4.6 |
+| intel_lab | 99.5% | **100.0%** | **100.0%** | 9.5 | 3.8 |
+| intel_log | 99.2% | **100.0%** | **100.0%** | 24.5 | 4.5 |
+| corridor15x | 73.5% | 91.2% | 90.5% | 6.7 | 4.2 |
+| corridor17 | 83.3% | 93.7% | 94.7% | 6.9 | 4.3 |
+| corridor_zigzag | 50.7% | 82.5% | 84.5% | 5.6 | 2.5 |
+| **Pooled** | **86.9%** | **96.4%** | **96.6%** | | |
+
+- **Inside the window the prior's size does not matter.** 1 m and 3 m give the same result,
+  and going outside it (4 m / 40 deg) drops to about 92%. That is the designed behaviour
+- **The corridor maps gain the most** (50.7% -> 84.5%): where a single scan cannot resolve a
+  self-similar environment, a prior removes the ambiguity
+- **TRACK's time does not depend on map size.** On the largest map it is 4.5 ms against
+  GLOBAL's 24.5 ms (5.4x)
+
+**This is a simulation of prior error drawn from a uniform distribution, not real odometry
+error.** Continuous-driving behaviour (accumulated drift, sustained dynamic obstacles,
+recovery from kidnap) is not measured.
+
 ### Against the Radon sinogram method
 
 The sibling package's evaluator on **the same 5400 scans** (WFRAC threshold calibrated per
@@ -126,6 +155,9 @@ space or image space**. The history and the mechanism are in
 - The corridor results (49-83%) show that **a self-similar environment does not resolve from
   a single scan**. That ambiguity belongs to odometry or motion.
 - Times come from one x86 machine; the ratio may differ on embedded hardware.
+- **TRACK is only measured as a one-shot local search.** The state machine (GLOBAL <-> TRACK
+  transitions, jump rejection, kidnap recovery) is checked by unit tests for its invariants,
+  but its behaviour over a continuous drive is not measured.
 
 ## Reproduction
 

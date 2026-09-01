@@ -66,6 +66,10 @@ struct MatcherParams
   double map_normal_sigma = 3.0;     ///< 地図法線を作る自由空間マスクのぼかし [px]
   double wfrac_tolerance_m = 0.10;   ///< WFRAC の基本許容 [m]
 
+  // ---- TRACK (事前姿勢の周りだけを探す局所探索) ----
+  double track_search_m = 3.0;       ///< 事前姿勢からの位置探索半径 [m]
+  int track_angle_window_deg = 30;   ///< 事前姿勢からの角度探索幅 [deg]
+
   /// margin_pixels がテンプレートを切らないための下限。
   int minimumMargin() const;
   /// 相関の外挿が 0 で済む十分条件 (これを満たすと DFT が最小になる)。
@@ -89,6 +93,14 @@ public:
 
   /// 大域探索。スコア降順の候補を最大 candidate_pool_size 個返す。
   std::vector<PoseCandidate> localize(const std::vector<Beam> & beams) const;
+
+  /// 局所探索 (TRACK)。事前姿勢 `prior` の周り
+  /// (±track_search_m、±track_angle_window_deg) だけを探す。
+  /// 粗段を FFT ではなく疎な点列の直接相関で走査するので、位置の候補数が
+  /// 地図全体の数百分の一になる分そのまま速い。細段は localize() と共通。
+  /// 事前姿勢が地図の外なら空を返す。
+  std::vector<PoseCandidate> track(
+    const std::vector<Beam> & beams, const PoseCandidate & prior) const;
 
   /// 候補姿勢でスキャン点を地図に重ね、壁に載らない点の割合を返す (0..1)。
   double wallMissFraction(const PoseCandidate & pose, const std::vector<Beam> & beams) const;

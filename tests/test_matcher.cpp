@@ -68,6 +68,8 @@ std::vector<Beam> castScan(
 
 }  // namespace
 
+struct GT { double x, y, yaw; };
+
 int main()
 {
   const double res = 0.05, ox = -5.0, oy = -5.0;
@@ -94,7 +96,6 @@ int main()
   check(loc.hasMap(), "setMap 後は hasMap() が true");
 
   printf("== 既知姿勢の復元 ==\n");
-  struct GT { double x, y, yaw; };
   const std::vector<GT> gts = {
     {2.0, 2.0, 0.0}, {-1.5, 3.0, 1.2}, {4.0, -2.0, -2.5}, {0.5, -3.5, 3.0},
   };
@@ -156,6 +157,47 @@ int main()
     printf("== 段階別の計測 ==\n");
     const auto & st = loc.lastStageTimes();
     check(st.total() > 0, "段階別の所要時間が記録される");
+  }
+
+  printf("== TRACK (局所探索) ==\n");
+  {
+    int recovered = 0, in_window = 0;
+    for (const GT & g : gts) {
+      const std::vector<Beam> beams =
+        castScan(map, res, ox, oy, g.x, g.y, g.yaw, p.max_range);
+      // 事前姿勢を窓の内側で崩す (オドメトリ誤差の模擬)
+      PoseCandidate prior;
+      prior.x = g.x + 0.8;
+      prior.y = g.y - 0.6;
+      prior.yaw = g.yaw + 12.0 * M_PI / 180.0;
+      const std::vector<PoseCandidate> cands = loc.track(beams, prior);
+      if (cands.empty()) continue;
+      const double pe = std::hypot(cands[0].x - g.x, cands[0].y - g.y);
+      double ae = std::fabs((cands[0].yaw - g.yaw) * 180.0 / M_PI);
+      while (ae > 180) ae = std::fabs(ae - 360);
+      if (pe < 0.5 && ae < 10.0) recovered++;
+      // 返る解は必ず探索窓の内側にある
+      const double dp = std::hypot(cands[0].x - prior.x, cands[0].y - prior.y);
+      double da = std::fabs((cands[0].yaw - prior.yaw) * 180.0 / M_PI);
+      while (da > 180) da = std::fabs(da - 360);
+      if (dp <= p.track_search_m + 0.5 &&
+        da <= p.track_angle_window_deg + p.refine_angle_window + 1) { in_window++; }
+    }
+    check(recovered == static_cast<int>(gts.size()),
+      "窓の内側の事前姿勢から全姿勢を復元する (" + std::to_string(recovered) + "/" +
+      std::to_string(gts.size()) + ")");
+    check(in_window == static_cast<int>(gts.size()),
+      "TRACK が返す解は探索窓の内側にある");
+
+    // 地図の外を事前姿勢に与えたら空を返す
+    const std::vector<Beam> beams =
+      castScan(map, res, ox, oy, gts[0].x, gts[0].y, gts[0].yaw, p.max_range);
+    PoseCandidate far_prior;
+    far_prior.x = 1e4;
+    far_prior.y = 1e4;
+    far_prior.yaw = 0.0;
+    check(loc.track(beams, far_prior).empty(), "地図の外の事前姿勢では空を返す");
+    check(loc.track({}, far_prior).empty(), "ビームが無ければ空を返す");
   }
 
   printf("\n=====================================\n");

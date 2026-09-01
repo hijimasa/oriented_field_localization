@@ -311,6 +311,251 @@ struct OrientedFieldLocalizer::Impl
     ry = wx * s + wy * c;
   }
 
+  /// テンプレートの点列を alpha [deg] 回した整数格子上の点列にする。
+  /// 画像座標 (y 下向き) なので、位置も法線も同じ回転行列で回る。
+  static void rotatePoints(
+    const Tpl & T, int alpha, std::vector<int> & rpx, std::vector<int> & rpy,
+    std::vector<float> & rm, std::vector<float> & rnx, std::vector<float> & rny)
+  {
+    const size_t np = T.px.size();
+    const double th = alpha * CV_PI / 180.0;
+    const double ca = std::cos(th), sa = std::sin(th);
+    rpx.resize(np); rpy.resize(np); rm.resize(np); rnx.resize(np); rny.resize(np);
+    for (size_t i = 0; i < np; i++) {
+      rpx[i] = static_cast<int>(std::lround(ca * T.px[i] + sa * T.py[i]));
+      rpy[i] = static_cast<int>(std::lround(-sa * T.px[i] + ca * T.py[i]));
+      rm[i] = T.m[i];
+      rnx[i] = static_cast<float>(ca * T.nx[i] + sa * T.ny[i]);
+      rny[i] = static_cast<float>(-sa * T.nx[i] + ca * T.ny[i]);
+    }
+  }
+
+  /// 回した点列を (u, v) に置いたときの相関 (正規化前)。
+  static double numeratorAt(
+    const Level & L, const std::vector<int> & rpx, const std::vector<int> & rpy,
+    const std::vector<float> & rm, const std::vector<float> & rnx,
+    const std::vector<float> & rny, int u, int v, double mass_w, double lam2)
+  {
+    double num = 0;
+    const size_t np = rpx.size();
+    for (size_t i = 0; i < np; i++) {
+      const int X = u + rpx[i], Y = v + rpy[i];
+      if (X < 0 || X >= L.w || Y < 0 || Y >= L.h) continue;
+      num += mass_w * L.M.at<float>(Y, X) * rm[i] +
+        lam2 * (L.X.at<float>(Y, X) * rnx[i] + L.Y.at<float>(Y, X) * rny[i]);
+    }
+    return num;
+  }
+
+  // ---- 粗段: 全 alpha x 全位置を FFT 相関 ----
+  std::vector<Cand> coarseSweep(const Tpl & TC)
+  {
+    const int kc = static_cast<int>(levels.size()) - 1;
+    const Level & LC = levels[kc];
+    const double lam2 = p.normal_weight * p.normal_weight;
+    std::vector<int> alphas;
+    for (int a = 0; a < 360; a += p.coarse_angle_step) alphas.push_back(a);
+    const int nms_px_c = p.nms_separation_m > 0.0
+      ? std::max(4, static_cast<int>(std::lround(p.nms_separation_m / LC.res))) : 0;
+    std::vector<std::vector<Cand>> per_angle(alphas.size());
+    const double inv_eb_c = 1.0 / std::sqrt(TC.Eb);
+    const int u0 = LC.margin, u1 = LC.margin + LC.map_w;
+    const int v0 = LC.margin, v1 = LC.margin + LC.map_h;
+    const int sw = u1 - u0, sh = v1 - v0;
+    double s_prep = 0, s_corr = 0, s_peak = 0;
+
+#pragma omp parallel reduction(+ : s_prep, s_corr, s_peak)
+    {
+      // 作業領域はスレッドごとに 1 回だけ確保・ゼロ埋めする (canvas の外は常にゼロ)
+      cv::Mat pad = cv::Mat::zeros(LC.fh, LC.fw, CV_32F);
+      cv::Mat rm, rx, ry, fm, fx, fy, pm, pxs, pys, acc, num;
+      std::vector<float> sm;
+      auto specInto = [&](const cv::Mat & src, cv::Mat & dst) {
+          src.copyTo(pad(cv::Rect(0, 0, LC.D, LC.D)));
+          cv::dft(pad, dst, 0, LC.D);
+        };
+#pragma omp for schedule(dynamic)
+      for (int ai = 0; ai < static_cast<int>(alphas.size()); ai++) {
+        const double a0 = nowSec();
+        rotateTpl(TC, alphas[ai], rm, rx, ry);
+        specInto(rm, fm);
+        specInto(rx, fx);
+        specInto(ry, fy);
+        const double a1 = nowSec();
+        cv::mulSpectrums(LC.MF, fm, pm, 0, true);
+        cv::mulSpectrums(LC.XF, fx, pxs, 0, true);
+        cv::mulSpectrums(LC.YF, fy, pys, 0, true);
+        cv::addWeighted(pm, p.mass_weight, pxs, lam2, 0.0, acc);
+        cv::scaleAdd(pys, lam2, acc, acc);
+        cv::dft(acc, num, cv::DFT_INVERSE | cv::DFT_SCALE | cv::DFT_REAL_OUTPUT);
+        const double a2 = nowSec();
+
+        sm.assign(static_cast<size_t>(sw) * sh, -2.0f);
+        for (int v = v0; v < v1; v++) {
+          const float * nr = num.ptr<float>(v - LC.off);
+          const float * er = LC.Ea.ptr<float>(v - LC.off);
+          float * dr = &sm[static_cast<size_t>(v - v0) * sw];
+          for (int u = u0; u < u1; u++) {
+            if (er[u - LC.off] < 1e-6f) continue;   // footprint に地図が無い位置
+            dr[u - u0] = static_cast<float>(nr[u - LC.off] * inv_eb_c);
+          }
+        }
+        per_angle[ai] = greedyPeaks(sm, sw, sh, u0, v0, alphas[ai], nms_px_c);
+        s_prep += a1 - a0;
+        s_corr += a2 - a1;
+        s_peak += nowSec() - a2;
+      }
+    }
+    {
+      // スレッド合計を並列度で割り、他の段 (壁時計) と同じ尺度へ揃える
+      const double par = static_cast<double>(omp_get_max_threads());
+      stage.prep = 1000 * s_prep / par;
+      stage.corr = 1000 * s_corr / par;
+      stage.peak = 1000 * s_peak / par;
+    }
+    std::vector<Cand> cands;
+    for (auto & v : per_angle) cands.insert(cands.end(), v.begin(), v.end());
+    return nms(std::move(cands), nms_px_c, p.nms_separation_deg, p.candidate_pool_size);
+  }
+
+  // ---- TRACK: 事前姿勢の周りだけを直接相関で走査する ----
+  // 粗段の窓 (±track_search_m, ±track_angle_window_deg) を疎な点列で総当たりする。
+  // 位置の候補数が地図全体の数百分の一なので、FFT を使うより直接評価が安い。
+  std::vector<Cand> localSweep(const Tpl & TC, const PoseCandidate & prior)
+  {
+    const int kc = static_cast<int>(levels.size()) - 1;
+    const Level & LC = levels[kc];
+    const double lam2 = p.normal_weight * p.normal_weight;
+    const double inv_eb = 1.0 / std::sqrt(TC.Eb);
+
+    // 事前姿勢を粗段の画素へ落とす (toWorld の逆写像)
+    const double px = (prior.x - origin_x) / LC.res;
+    const double py = LC.map_h - 1 - (prior.y - origin_y) / LC.res;
+    const int cu = static_cast<int>(std::lround(px)) + LC.margin;
+    const int cv_ = static_cast<int>(std::lround(py)) + LC.margin;
+    int prior_deg = static_cast<int>(std::lround(prior.yaw * 180.0 / CV_PI));
+    prior_deg = ((prior_deg % 360) + 360) % 360;
+
+    const int SR = std::max(1, static_cast<int>(std::lround(p.track_search_m / LC.res)));
+    std::vector<int> alphas;
+    for (int d = -p.track_angle_window_deg; d <= p.track_angle_window_deg;
+      d += p.coarse_angle_step)
+    {
+      alphas.push_back(((prior_deg + d) % 360 + 360) % 360);
+    }
+    const int nms_px = p.nms_separation_m > 0.0
+      ? std::max(2, static_cast<int>(std::lround(p.nms_separation_m / LC.res))) : 0;
+
+    const int u0 = std::max(LC.margin, cu - SR);
+    const int u1 = std::min(LC.margin + LC.map_w, cu + SR + 1);
+    const int v0 = std::max(LC.margin, cv_ - SR);
+    const int v1 = std::min(LC.margin + LC.map_h, cv_ + SR + 1);
+    if (u1 <= u0 || v1 <= v0) return {};    // 事前姿勢が地図の外
+    const int sw = u1 - u0, sh = v1 - v0;
+
+    std::vector<std::vector<Cand>> per_angle(alphas.size());
+    const double t0 = nowSec();
+#pragma omp parallel for schedule(dynamic)
+    for (int ai = 0; ai < static_cast<int>(alphas.size()); ai++) {
+      std::vector<int> rpx, rpy;
+      std::vector<float> rm, rnx, rny;
+      rotatePoints(TC, alphas[ai], rpx, rpy, rm, rnx, rny);
+      std::vector<float> sm(static_cast<size_t>(sw) * sh, -2.0f);
+      for (int v = v0; v < v1; v++) {
+        for (int u = u0; u < u1; u++) {
+          sm[static_cast<size_t>(v - v0) * sw + (u - u0)] = static_cast<float>(
+            numeratorAt(LC, rpx, rpy, rm, rnx, rny, u, v, p.mass_weight, lam2) * inv_eb);
+        }
+      }
+      per_angle[ai] = greedyPeaks(sm, sw, sh, u0, v0, alphas[ai], nms_px);
+    }
+    stage.corr = 1000 * (nowSec() - t0);
+
+    std::vector<Cand> cands;
+    for (auto & v : per_angle) cands.insert(cands.end(), v.begin(), v.end());
+    return nms(std::move(cands), nms_px, p.nms_separation_deg, p.candidate_pool_size);
+  }
+
+  /// スコア場から貪欲に argmax + 抑制でピークを拾う。
+  std::vector<Cand> greedyPeaks(
+    std::vector<float> & sm, int sw, int sh, int u0, int v0, int alpha, int nms_px) const
+  {
+    std::vector<Cand> peaks;
+    for (int k = 0; k < p.peaks_per_angle; k++) {
+      size_t bi = 0;
+      float bs = -1.5f;
+      for (size_t i = 0; i < sm.size(); i++) {
+        if (sm[i] > bs) { bs = sm[i]; bi = i; }
+      }
+      if (bs <= -1.5f) break;
+      const int bu = u0 + static_cast<int>(bi % sw), bv = v0 + static_cast<int>(bi / sw);
+      peaks.push_back({alpha, bu, bv, bs});
+      const int r = std::max(1, nms_px);
+      for (int v = std::max(0, bv - v0 - r); v < std::min(sh, bv - v0 + r + 1); v++) {
+        for (int u = std::max(0, bu - u0 - r); u < std::min(sw, bu - u0 + r + 1); u++) {
+          if (std::hypot(static_cast<double>(u + u0 - bu), static_cast<double>(v + v0 - bv))
+            < nms_px)
+          {
+            sm[static_cast<size_t>(v) * sw + u] = -2.0f;
+          }
+        }
+      }
+    }
+    return peaks;
+  }
+
+  // ---- 細段: 候補ごとに狭い角度・位置窓を直接相関で精密化する ----
+  std::vector<Cand> refineDown(std::vector<Cand> cands, const std::vector<Tpl> & tpl)
+  {
+    const int kc = static_cast<int>(levels.size()) - 1;
+    const double lam2 = p.normal_weight * p.normal_weight;
+    const double t0 = nowSec();
+    const int SR = std::max(1, static_cast<int>(std::lround(
+        p.refine_search_m / p.match_resolution)));
+    for (int kcur = kc - 1; kcur >= 0; kcur--) {
+      const Level & L = levels[kcur];
+      const Tpl & T = tpl[kcur];
+      const int ratio = levels[kcur + 1].scale / L.scale;
+      for (Cand & c : cands) {
+        const double up = (c.u - levels[kcur + 1].margin + 0.5) * ratio - 0.5 + L.margin;
+        const double vp = (c.v - levels[kcur + 1].margin + 0.5) * ratio - 0.5 + L.margin;
+        c.u = static_cast<int>(std::lround(up));
+        c.v = static_cast<int>(std::lround(vp));
+      }
+      const int n_per = 2 * p.refine_angle_window + 1;
+      const int n_jobs = static_cast<int>(cands.size()) * n_per;
+      std::vector<Cand> ref(n_jobs);
+      const double inv_eb = 1.0 / std::sqrt(T.Eb);
+#pragma omp parallel for schedule(dynamic)
+      for (int job = 0; job < n_jobs; job++) {
+        const int ci = job / n_per;
+        const int alpha =
+          ((cands[ci].angle + (job % n_per) - p.refine_angle_window) % 360 + 360) % 360;
+        std::vector<int> rpx, rpy;
+        std::vector<float> rm, rnx, rny;
+        rotatePoints(T, alpha, rpx, rpy, rm, rnx, rny);
+        Cand best{alpha, cands[ci].u, cands[ci].v, -2.0};
+        for (int dv = -SR; dv <= SR; dv++) {
+          for (int du = -SR; du <= SR; du++) {
+            const int u = cands[ci].u + du, v = cands[ci].v + dv;
+            if (u < L.margin || u >= L.margin + L.map_w ||
+              v < L.margin || v >= L.margin + L.map_h) continue;
+            const double s =
+              numeratorAt(L, rpx, rpy, rm, rnx, rny, u, v, p.mass_weight, lam2) * inv_eb;
+            if (s > best.score) { best.u = u; best.v = v; best.score = s; }
+          }
+        }
+        ref[job] = best;
+      }
+      const int keep = (kcur == 0) ? p.candidate_pool_size : p.intermediate_pool_size;
+      const int nms_px = p.nms_separation_m > 0.0
+        ? std::max(4, static_cast<int>(std::lround(p.nms_separation_m / L.res))) : 0;
+      cands = nms(std::move(ref), nms_px, p.nms_separation_deg, keep);
+    }
+    stage.fine = 1000 * (nowSec() - t0);
+    return cands;
+  }
+
   PoseCandidate toWorld(const Cand & c) const
   {
     const Level & L0 = levels[0];
@@ -450,32 +695,23 @@ void OrientedFieldLocalizer::setMap(
   }
   I.has_map = true;
 }
+// ---- テンプレート構築を localize() と track() で共有する ----
 
-std::vector<PoseCandidate> OrientedFieldLocalizer::localize(
-  const std::vector<Beam> & beams) const
+namespace
 {
-  Impl & I = *impl_;
-  const MatcherParams & p = I.p;
-  I.stage = StageTimes();
-  if (!I.has_map || beams.empty()) return {};
-
-  const int n_lv = static_cast<int>(I.levels.size());
+/// 段ごとのテンプレート。D x D の canvas は粗段の FFT でしか使わないので、
+/// 細段では確保もゼロ埋めもしない (点列だけで足りる)。
+bool buildTemplates(
+  const MatcherParams & p, const std::vector<Level> & levels, const cv::Mat & swb,
+  const cv::Mat & snx, const cv::Mat & sny, std::vector<Tpl> & tpl)
+{
+  const int n_lv = static_cast<int>(levels.size());
   const int kc = n_lv - 1;
-
-  // ---- 表現づくり ----
-  double t0 = nowSec();
-  cv::Mat swb = I.scanToGrid(beams);
-  cv::Mat snx, sny;
-  I.scanNormals(beams, swb, snx, sny);
-  I.stage.repr = 1000 * (nowSec() - t0);
-
-  // ---- 段ごとのテンプレート ----
-  t0 = nowSec();
-  std::vector<Tpl> tpl(n_lv);
   const double lam2 = p.normal_weight * p.normal_weight;
+  tpl.assign(n_lv, Tpl());
   for (int k = 0; k < n_lv; k++) {
-    const Level & L = I.levels[k];
-    int sc = L.scale;
+    const Level & L = levels[k];
+    const int sc = L.scale;
     cv::Mat lw;
     if (sc > 1) {
       cv::resize(swb, lw, cv::Size(), 1.0 / sc, 1.0 / sc, cv::INTER_AREA);
@@ -492,27 +728,26 @@ std::vector<PoseCandidate> OrientedFieldLocalizer::localize(
     cv::Mat mass;
     lw.convertTo(mass, CV_32F, 1.0 / 255.0);
     Tpl & T = tpl[k];
-    // D x D の canvas は粗段の FFT でしか使わない。細段は点列だけで足りる。
     const bool need_canvas = (k == kc);
     if (need_canvas) {
       T.M = cv::Mat::zeros(L.D, L.D, CV_32F);
       T.X = cv::Mat::zeros(L.D, L.D, CV_32F);
       T.Y = cv::Mat::zeros(L.D, L.D, CV_32F);
     }
-    int c = lw.cols / 2;
-    int R = L.R;
+    const int c = lw.cols / 2;
+    const int R = L.R;
     double eb = 0;
     std::vector<cv::Point> pts;
     cv::findNonZero(lw, pts);
     T.px.reserve(pts.size()); T.py.reserve(pts.size());
     T.m.reserve(pts.size()); T.nx.reserve(pts.size()); T.ny.reserve(pts.size());
     for (const cv::Point & q : pts) {
-      int cx = q.x - c + R, cy = q.y - c + R;
+      const int cx = q.x - c + R, cy = q.y - c + R;
       if (cx < 0 || cx >= L.D || cy < 0 || cy >= L.D) continue;
-      float mm = mass.at<float>(q.y, q.x);
+      const float mm = mass.at<float>(q.y, q.x);
       if (mm <= 0) continue;
-      float bx = mm * lnx.at<float>(q.y, q.x);
-      float by = mm * lny.at<float>(q.y, q.x);
+      const float bx = mm * lnx.at<float>(q.y, q.x);
+      const float by = mm * lny.at<float>(q.y, q.x);
       if (need_canvas) {
         T.M.at<float>(cy, cx) = mm;
         T.X.at<float>(cy, cx) = bx;
@@ -527,165 +762,71 @@ std::vector<PoseCandidate> OrientedFieldLocalizer::localize(
         lam2 * (static_cast<double>(bx) * bx + static_cast<double>(by) * by);
     }
     T.Eb = eb;
-    if (T.Eb < 1e-9 || T.px.empty()) { I.stage.xform = 1000 * (nowSec() - t0); return {}; }
+    if (T.Eb < 1e-9 || T.px.empty()) return false;
   }
-  I.stage.xform = 1000 * (nowSec() - t0);
+  return true;
+}
+}  // namespace
 
-  // ---- 粗段: 全 alpha x 全位置を FFT 相関 ----
-  const Level & LC = I.levels[kc];
-  const Tpl & TC = tpl[kc];
-  std::vector<int> alphas;
-  for (int a = 0; a < 360; a += p.coarse_angle_step) alphas.push_back(a);
-  const int nms_px_c = p.nms_separation_m > 0.0
-    ? std::max(4, static_cast<int>(std::lround(p.nms_separation_m / LC.res))) : 0;
-  std::vector<std::vector<Cand>> per_angle(alphas.size());
-  const double inv_eb_c = 1.0 / std::sqrt(TC.Eb);
-  const int u0 = LC.margin, u1 = LC.margin + LC.map_w;
-  const int v0 = LC.margin, v1 = LC.margin + LC.map_h;
-  const int sw = u1 - u0, sh = v1 - v0;
-  double s_prep = 0, s_corr = 0, s_peak = 0;
+std::vector<PoseCandidate> OrientedFieldLocalizer::localize(
+  const std::vector<Beam> & beams) const
+{
+  Impl & I = *impl_;
+  I.stage = StageTimes();
+  if (!I.has_map || beams.empty()) return {};
+  const int kc = static_cast<int>(I.levels.size()) - 1;
 
-#pragma omp parallel reduction(+ : s_prep, s_corr, s_peak)
-  {
-    // 作業領域はスレッドごとに 1 回だけ確保・ゼロ埋めする (canvas の外は常にゼロ)
-    cv::Mat pad = cv::Mat::zeros(LC.fh, LC.fw, CV_32F);
-    cv::Mat rm, rx, ry, fm, fx, fy, pm, pxs, pys, acc, num;
-    std::vector<float> sm;
-    auto specInto = [&](const cv::Mat & src, cv::Mat & dst) {
-        src.copyTo(pad(cv::Rect(0, 0, LC.D, LC.D)));
-        cv::dft(pad, dst, 0, LC.D);
-      };
-#pragma omp for schedule(dynamic)
-    for (int ai = 0; ai < static_cast<int>(alphas.size()); ai++) {
-      double a0 = nowSec();
-      Impl::rotateTpl(TC, alphas[ai], rm, rx, ry);
-      specInto(rm, fm);
-      specInto(rx, fx);
-      specInto(ry, fy);
-      double a1 = nowSec();
-      cv::mulSpectrums(LC.MF, fm, pm, 0, true);
-      cv::mulSpectrums(LC.XF, fx, pxs, 0, true);
-      cv::mulSpectrums(LC.YF, fy, pys, 0, true);
-      cv::addWeighted(pm, p.mass_weight, pxs, lam2, 0.0, acc);
-      cv::scaleAdd(pys, lam2, acc, acc);
-      cv::dft(acc, num, cv::DFT_INVERSE | cv::DFT_SCALE | cv::DFT_REAL_OUTPUT);
-      double a2 = nowSec();
+  double t0 = nowSec();
+  cv::Mat swb = I.scanToGrid(beams);
+  cv::Mat snx, sny;
+  I.scanNormals(beams, swb, snx, sny);
+  I.stage.repr = 1000 * (nowSec() - t0);
 
-      sm.assign(static_cast<size_t>(sw) * sh, -2.0f);
-      for (int v = v0; v < v1; v++) {
-        const float * nr = num.ptr<float>(v - LC.off);
-        const float * er = LC.Ea.ptr<float>(v - LC.off);
-        float * dr = &sm[static_cast<size_t>(v - v0) * sw];
-        for (int u = u0; u < u1; u++) {
-          if (er[u - LC.off] < 1e-6f) continue;   // footprint に地図が無い位置
-          dr[u - u0] = static_cast<float>(nr[u - LC.off] * inv_eb_c);
-        }
-      }
-      // 貪欲な argmax + 抑制
-      std::vector<Cand> peaks;
-      for (int k = 0; k < p.peaks_per_angle; k++) {
-        size_t bi = 0;
-        float bs = -1.5f;
-        for (size_t i = 0; i < sm.size(); i++) {
-          if (sm[i] > bs) { bs = sm[i]; bi = i; }
-        }
-        if (bs <= -1.5f) break;
-        int bu = u0 + static_cast<int>(bi % sw), bv = v0 + static_cast<int>(bi / sw);
-        peaks.push_back({alphas[ai], bu, bv, bs});
-        int r = std::max(1, nms_px_c);
-        for (int v = std::max(v0, bv - r); v < std::min(v1, bv + r + 1); v++) {
-          for (int u = std::max(u0, bu - r); u < std::min(u1, bu + r + 1); u++) {
-            if (std::hypot(static_cast<double>(u - bu), static_cast<double>(v - bv)) < nms_px_c) {
-              sm[static_cast<size_t>(v - v0) * sw + (u - u0)] = -2.0f;
-            }
-          }
-        }
-      }
-      per_angle[ai] = std::move(peaks);
-      s_prep += a1 - a0;
-      s_corr += a2 - a1;
-      s_peak += nowSec() - a2;
-    }
-  }
-  {
-    // スレッド合計を並列度で割り、他の段 (壁時計) と同じ尺度へ揃える
-    double par = static_cast<double>(omp_get_max_threads());
-    I.stage.prep = 1000 * s_prep / par;
-    I.stage.corr = 1000 * s_corr / par;
-    I.stage.peak = 1000 * s_peak / par;
-  }
-
-  std::vector<Cand> cands;
-  for (auto & v : per_angle) cands.insert(cands.end(), v.begin(), v.end());
-  cands = I.nms(std::move(cands), nms_px_c, p.nms_separation_deg, p.candidate_pool_size);
-
-  // ---- 細段: 候補ごとに ±angle_window 度 x ±refine px を直接相関 ----
   t0 = nowSec();
-  const int SR = std::max(1, static_cast<int>(std::lround(
-    p.refine_search_m / p.match_resolution)));
-  for (int kcur = kc - 1; kcur >= 0; kcur--) {
-    const Level & L = I.levels[kcur];
-    const Tpl & T = tpl[kcur];
-    int ratio = I.levels[kcur + 1].scale / L.scale;
-    for (Cand & c : cands) {
-      double up = (c.u - I.levels[kcur + 1].margin + 0.5) * ratio - 0.5 + L.margin;
-      double vp = (c.v - I.levels[kcur + 1].margin + 0.5) * ratio - 0.5 + L.margin;
-      c.u = static_cast<int>(std::lround(up));
-      c.v = static_cast<int>(std::lround(vp));
-    }
-    int n_per = 2 * p.refine_angle_window + 1;
-    int n_jobs = static_cast<int>(cands.size()) * n_per;
-    std::vector<Cand> ref(n_jobs);
-    const double inv_eb = 1.0 / std::sqrt(T.Eb);
-    const size_t np = T.px.size();
-#pragma omp parallel for schedule(dynamic)
-    for (int job = 0; job < n_jobs; job++) {
-      int ci = job / n_per;
-      int alpha = ((cands[ci].angle + (job % n_per) - p.refine_angle_window) % 360 + 360) % 360;
-      double th = alpha * CV_PI / 180.0;
-      double ca = std::cos(th), sa = std::sin(th);
-      std::vector<int> rpx(np), rpy(np);
-      std::vector<float> rm(np), rnx(np), rny(np);
-      for (size_t i = 0; i < np; i++) {
-        double X = ca * T.px[i] + sa * T.py[i];
-        double Y = -sa * T.px[i] + ca * T.py[i];
-        rpx[i] = static_cast<int>(std::lround(X));
-        rpy[i] = static_cast<int>(std::lround(Y));
-        rm[i] = T.m[i];
-        rnx[i] = static_cast<float>(ca * T.nx[i] + sa * T.ny[i]);
-        rny[i] = static_cast<float>(-sa * T.nx[i] + ca * T.ny[i]);
-      }
-      Cand best{alpha, cands[ci].u, cands[ci].v, -2.0};
-      for (int dv = -SR; dv <= SR; dv++) {
-        for (int du = -SR; du <= SR; du++) {
-          int u = cands[ci].u + du, v = cands[ci].v + dv;
-          if (u < L.margin || u >= L.margin + L.map_w ||
-            v < L.margin || v >= L.margin + L.map_h) continue;
-          double numv = 0;
-          for (size_t i = 0; i < np; i++) {
-            int X = u + rpx[i], Y = v + rpy[i];
-            if (X < 0 || X >= L.w || Y < 0 || Y >= L.h) continue;
-            numv += p.mass_weight * L.M.at<float>(Y, X) * rm[i] +
-              lam2 * (L.X.at<float>(Y, X) * rnx[i] + L.Y.at<float>(Y, X) * rny[i]);
-          }
-          double s = numv * inv_eb;
-          if (s > best.score) { best.u = u; best.v = v; best.score = s; }
-        }
-      }
-      ref[job] = best;
-    }
-    int keep = (kcur == 0) ? p.candidate_pool_size : p.intermediate_pool_size;
-    int nms_px = p.nms_separation_m > 0.0
-      ? std::max(4, static_cast<int>(std::lround(p.nms_separation_m / L.res))) : 0;
-    cands = I.nms(std::move(ref), nms_px, p.nms_separation_deg, keep);
-  }
-  I.stage.fine = 1000 * (nowSec() - t0);
+  std::vector<Tpl> tpl;
+  const bool ok = buildTemplates(I.p, I.levels, swb, snx, sny, tpl);
+  I.stage.xform = 1000 * (nowSec() - t0);
+  if (!ok) return {};
+
+  std::vector<Cand> cands = I.coarseSweep(tpl[kc]);
+  cands = I.refineDown(std::move(cands), tpl);
 
   std::vector<PoseCandidate> out;
   out.reserve(cands.size());
   for (const Cand & c : cands) out.push_back(I.toWorld(c));
   return out;
 }
+
+std::vector<PoseCandidate> OrientedFieldLocalizer::track(
+  const std::vector<Beam> & beams, const PoseCandidate & prior) const
+{
+  Impl & I = *impl_;
+  I.stage = StageTimes();
+  if (!I.has_map || beams.empty()) return {};
+  const int kc = static_cast<int>(I.levels.size()) - 1;
+
+  double t0 = nowSec();
+  cv::Mat swb = I.scanToGrid(beams);
+  cv::Mat snx, sny;
+  I.scanNormals(beams, swb, snx, sny);
+  I.stage.repr = 1000 * (nowSec() - t0);
+
+  t0 = nowSec();
+  std::vector<Tpl> tpl;
+  const bool ok = buildTemplates(I.p, I.levels, swb, snx, sny, tpl);
+  I.stage.xform = 1000 * (nowSec() - t0);
+  if (!ok) return {};
+
+  std::vector<Cand> cands = I.localSweep(tpl[kc], prior);
+  if (cands.empty()) return {};
+  cands = I.refineDown(std::move(cands), tpl);
+
+  std::vector<PoseCandidate> out;
+  out.reserve(cands.size());
+  for (const Cand & c : cands) out.push_back(I.toWorld(c));
+  return out;
+}
+
 
 double OrientedFieldLocalizer::wallMissFraction(
   const PoseCandidate & pose, const std::vector<Beam> & beams) const

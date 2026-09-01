@@ -28,6 +28,18 @@
     nms_separation_m: 2.0
     nms_separation_deg: 15
 
+    # ---- TRACK (事前姿勢の周りの局所探索) ----
+    enable_track: true           # false で常に GLOBAL
+    track_search_m: 3.0          # 事前姿勢からの位置探索半径 [m]。
+                                 # 事前誤差が窓の内側なら実測 100% で引き込む
+    track_angle_window_deg: 30   # 事前姿勢からの角度探索幅 [deg]
+    track_after_accepts: 3       # 連続採択が この回数に達したら TRACK へ移る
+    max_consecutive_rejects: 5   # 連続棄却が この回数に達したら GLOBAL へ戻る
+    max_accept_jump_m: 2.0       # TRACK で事前姿勢からこれ以上跳んだ解は捨てる [m]
+    max_accept_yaw_deg: 20.0     # 同上 [deg]。0 で無効
+    use_odometry: true           # /odom で事前姿勢を伝播する。false なら
+                                 # 最後の採択姿勢をそのまま事前姿勢にする
+
     # ---- 採択 ----
     wfrac_margin: 1.05           # 拮抗帯 (top1/top2 < この値) でだけ WFRAC で
                                  # 選び直す。0 で無効。1.05 は 9 地図で較正した値
@@ -36,7 +48,13 @@
                                  # (1.0 = 実質無効。誤 commit を嫌う場合に上げる)
 
     # ---- 出力 ----
-    auto_localize: false         # true でスキャンごとに自動実行
-    publish_tf: false            # true で map -> base_frame を配信する
+    auto_localize: false         # true でスキャンごとに GLOBAL を自動実行
+                                 # (TRACK 中はこれに関係なく毎スキャン走る)
+    publish_initialpose: true    # GLOBAL から初めて採択したときだけ /initialpose
+                                 # へ流す (AMCL への引き継ぎ)。以降は ~/pose のみ
+    tf_mode: "none"              # none / map_to_odom / map_to_base
+                                 # map_to_odom は REP-105 準拠 (use_odometry 必須)
+    transform_tolerance: 0.2     # TF を先付けする時間 [s]
     map_frame: "map"
+    odom_frame: "odom"
     base_frame: "base_link"

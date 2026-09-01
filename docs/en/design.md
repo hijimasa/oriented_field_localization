@@ -4,13 +4,15 @@ English | [日本語](../design.md)
 
 ## Goal and non-goals
 
-Estimate the map-frame pose `(x, y, yaw)` from one 2D `LaserScan` and an occupancy grid,
-**with no initial guess**.
+Estimate the map-frame pose `(x, y, yaw)` from one 2D `LaserScan` and an occupancy grid
+**with no initial guess**, and once converged keep following it with a local search around
+a prior.
 
-**It does not track.** The pose goes to `/initialpose` and everything after that is left to
-AMCL or similar (the same division of labour as CBGL). There is no odometry, no state
-machine, no ICP refinement, and no multi-scan accumulation. Build those on top if a
-continuous deployment needs them.
+Out of scope:
+
+- ICP / scan-matching refinement of the pose (for uses where this grid resolution is not enough)
+- Multi-scan accumulation, SLAM, map building
+- Internal (scan-to-scan) odometry. Without `/odom` the last accepted pose is used as the prior
 
 ## Score
 
@@ -77,6 +79,39 @@ and the DFT minimal.
 
 Padding naively by `R` grows the DFT side by about 1.4x and doubles the coarse-stage cost.
 
+## TRACK (local search)
+
+Once converged there is no need to search the whole map. `track()` sweeps only around the
+prior (`+-track_search_m`, `+-track_angle_window_deg`).
+
+Its coarse stage runs as a **direct correlation over the sparse point list** rather than an
+FFT: with a few hundredths of the map's positions to test, evaluating them directly is
+cheaper than paying for the transform. The fine stage is shared verbatim with GLOBAL and the
+score definition is identical, so GLOBAL and TRACK candidates are directly comparable.
+
+**TRACK's cost does not depend on the map size.** GLOBAL's coarse stage scales with map
+area; TRACK scales with the window only. On the largest map (52 x 50 m) GLOBAL measured
+24.5 ms against TRACK's 4.5 ms.
+
+### State machine (in the node)
+
+```text
+                track_after_accepts consecutive accepts
+       +-----------------------------------------+
+       |                                         v
+    GLOBAL <--- max_consecutive_rejects consecutive rejects --- TRACK
+```
+
+- The prior is the last accepted map pose plus the odometry delta since then. Without
+  `/odom` it is the last accepted pose itself (assuming motion between scans fits inside
+  `track_search_m`)
+- TRACK accepts or rejects on the **jump from the prior** (`max_accept_jump_m` /
+  `max_accept_yaw_deg`). The window is wide, so a solution that lands far away inside it is
+  treated as a one-off mismatch and dropped
+- After enough consecutive rejects the prior is discarded and the node returns to GLOBAL
+  (kidnap recovery)
+- Calling `~/global_localization` drops the tracking state and restarts from GLOBAL
+
 ## Acceptance
 
 Only when the top-1 and top-2 scores are within `wfrac_margin` of each other does **WFRAC**
@@ -110,6 +145,8 @@ effectively off. Raise it where a wrong commit is costly.
 - `coarse_angle_step` divides 360
 - No estimate is produced without a map, or with fewer than 8 valid beams
 - Candidates come back score-descending and NMS-separated
+- Whatever `track()` returns lies inside the search window; a prior outside the map returns
+  nothing
 
 `tests/test_matcher.cpp` checks these.
 
