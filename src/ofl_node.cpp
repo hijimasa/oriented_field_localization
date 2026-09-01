@@ -150,6 +150,8 @@ public:
     track_max_wfrac_ = declare_parameter("track_max_wfrac", 0.35);
     use_odometry_ = declare_parameter("use_odometry", true);
     publish_initialpose_ = declare_parameter("publish_initialpose", true);
+    initialpose_repeat_ = declare_parameter("initialpose_repeat", 5);
+    initialpose_wait_s_ = declare_parameter("initialpose_wait_s", 60);
     map_frame_ = declare_parameter("map_frame", std::string("map"));
     odom_frame_ = declare_parameter("odom_frame", std::string("odom"));
     base_frame_ = declare_parameter("base_frame", std::string("base_link"));
@@ -220,6 +222,30 @@ public:
         requested_ = true;
         cv_.notify_one();
       });
+
+    if (publish_initialpose_ && initialpose_repeat_ > 1) {
+      // /initialpose を 1 回きり volatile で出すと、購読側 (AMCL など) の
+      // activate がこちらの初回ロックより後になった場合に黙って失われる。
+      // **回数で待つのでは足りない** (実測で AMCL の activate は初回ロックの
+      // 6 秒後だった)。購読者が現れるまでは回数を消費せずに待ち、現れてから
+      // 出し直す。待ちは initialpose_wait_s_ 秒で打ち切る。
+      initialpose_timer_ = create_wall_timer(
+        std::chrono::seconds(1), [this] {
+          geometry_msgs::msg::PoseWithCovarianceStamped m;
+          {
+            std::lock_guard<std::mutex> lk(initialpose_mu_);
+            if (initialpose_left_ <= 0) return;
+            if (initialpose_pub_->get_subscription_count() == 0) {
+              if (++initialpose_waited_ > initialpose_wait_s_) initialpose_left_ = 0;
+              return;
+            }
+            initialpose_left_--;
+            m = initialpose_msg_;
+          }
+          m.header.stamp = now();
+          initialpose_pub_->publish(m);
+        });
+    }
 
     worker_ = std::thread(&OflNode::workerLoop, this);
     RCLCPP_INFO(get_logger(), "ready (%s, TRACK %s, odometry %s)",
@@ -486,7 +512,13 @@ private:
     m.pose.covariance[7] = 0.25;
     m.pose.covariance[35] = 0.07;
     pose_pub_->publish(m);
-    if (also_initialpose && publish_initialpose_) initialpose_pub_->publish(m);
+    if (also_initialpose && publish_initialpose_) {
+      initialpose_pub_->publish(m);
+      std::lock_guard<std::mutex> lk(initialpose_mu_);
+      initialpose_msg_ = m;
+      initialpose_left_ = initialpose_repeat_ - 1;
+      initialpose_waited_ = 0;
+    }
 
     if (!tf_broadcaster_) return;
     const rclcpp::Time tf_stamp =
@@ -540,6 +572,8 @@ private:
   double track_max_wfrac_ = 0.35;
   bool use_odometry_ = true;
   bool publish_initialpose_ = true;
+  int initialpose_repeat_ = 5;
+  int initialpose_wait_s_ = 60;
   double transform_tolerance_ = 0.2;
   TfMode tf_mode_ = TfMode::None;
   std::string map_frame_, odom_frame_, base_frame_;
@@ -557,6 +591,12 @@ private:
   Pose2D last_pose_, odom_, odom_at_accept_;
   bool has_pose_ = false, has_odom_ = false, had_odom_at_accept_ = false;
   int consecutive_accepts_ = 0, consecutive_rejects_ = 0;
+
+  std::mutex initialpose_mu_;
+  geometry_msgs::msg::PoseWithCovarianceStamped initialpose_msg_;
+  int initialpose_left_ = 0;
+  int initialpose_waited_ = 0;
+  rclcpp::TimerBase::SharedPtr initialpose_timer_;
 
   std::thread worker_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;

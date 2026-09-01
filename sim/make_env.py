@@ -65,7 +65,57 @@ def build_walls():
     return w, anchors, start, W, H
 
 
-def world_sdf(walls, W, H):
+def build_dynamic():
+    """動的障害物の定義を返す。**地図には焼かない** (未知の障害物である)。
+
+    経路の走行帯を横切る/沿って動くように置いてある。静止させて置くと
+    「地図に無い壁」でしかないので、往復させて遮蔽が入れ替わるようにする。
+    kinematic なリンクにしてあるので、物理では動かされず経路は完全に再現する
+    (位置推定の条件を変えても障害物の軌跡が同一でないと比較にならない)。
+    """
+    return [
+        # 東西の走行帯を横切る人
+        {'name': 'walker0', 'size': [0.40, 0.40, 1.20], 'speed': 0.9,
+         'path': [[9.0, 7.4], [9.0, 10.8]]},
+        # 走行帯に沿って往復する人 (正面から来て、追い越される)
+        {'name': 'walker1', 'size': [0.40, 0.40, 1.20], 'speed': 0.8,
+         'path': [[14.0, 9.7], [18.4, 9.7]]},
+        # 上の通路を横切る人
+        {'name': 'walker2', 'size': [0.40, 0.40, 1.20], 'speed': 0.7,
+         'path': [[13.0, 12.4], [13.0, 14.6]]},
+        # 南の走行帯を塞ぐように往復する台車 (大きく、遅い)
+        {'name': 'cart0', 'size': [0.70, 0.50, 0.90], 'speed': 0.45,
+         'path': [[6.5, 1.9], [11.0, 1.9]]},
+    ]
+
+
+def dynamic_sdf(dyn):
+    """動的障害物を kinematic なリンクとして world へ足す。
+
+    static にすると set_entity_state で動かしても衝突形状が追随しない実装が
+    あるため、非 static + kinematic (物理では動かないが衝突はする) にする。
+    """
+    parts = []
+    for d in dyn:
+        sx, sy, sz = d['size']
+        x, y = d['path'][0]
+        parts.append(f'''    <model name="{d['name']}">
+      <pose>{x:.3f} {y:.3f} {sz/2:.3f} 0 0 0</pose>
+      <link name="body">
+        <kinematic>true</kinematic>
+        <inertial><mass>30.0</mass><inertia><ixx>3.0</ixx><iyy>3.0</iyy>
+          <izz>3.0</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <collision name="c"><geometry><box><size>{sx} {sy} {sz}</size></box>
+          </geometry></collision>
+        <visual name="v"><geometry><box><size>{sx} {sy} {sz}</size></box></geometry>
+          <material><ambient>0.8 0.3 0.2 1</ambient>
+          <diffuse>0.9 0.4 0.25 1</diffuse></material></visual>
+      </link>
+    </model>''')
+    return parts
+
+
+def world_sdf(walls, W, H, dyn=()):
     parts = ['<?xml version="1.0" ?>',
              '<sdf version="1.6">', '  <world name="office">',
              '    <include><uri>model://sun</uri></include>',
@@ -95,7 +145,9 @@ def world_sdf(walls, W, H):
           </box></geometry><material><ambient>0.6 0.6 0.62 1</ambient>
           <diffuse>0.7 0.7 0.72 1</diffuse></material></visual>
       </link>''')
-    parts += ['    </model>', '  </world>', '</sdf>']
+    parts += ['    </model>']
+    parts += dynamic_sdf(dyn)
+    parts += ['  </world>', '</sdf>']
     return '\n'.join(parts)
 
 
@@ -220,13 +272,18 @@ def main():
     ap.add_argument('out_dir')
     ap.add_argument('--min-clearance', type=float, default=0.9,
                     help='経路が壁から確保するクリアランス [m]')
+    ap.add_argument('--dynamic', action='store_true',
+                    help='動的障害物を world に置く (地図には焼かない)')
     a = ap.parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
 
     walls, anchors, start, W, H = build_walls()
 
+    dyn = build_dynamic() if a.dynamic else []
     with open(os.path.join(a.out_dir, 'office.world'), 'w') as f:
-        f.write(world_sdf(walls, W, H))
+        f.write(world_sdf(walls, W, H, dyn))
+    with open(os.path.join(a.out_dir, 'dynamic.json'), 'w') as f:
+        json.dump(dyn, f, indent=2)
 
     img, ox, oy, res = occupancy_map(walls, W, H)
     clr = clearance_map(img, res)
@@ -252,6 +309,8 @@ def main():
                  for k in range(len(route) - 1))
     print(f"route: {len(route)} waypoints, {length:.1f} m, "
           f"min clearance {worst:.2f} m (>= {a.min_clearance})")
+    if dyn:
+        print(f"dynamic: {len(dyn)} obstacles (地図には含めない)")
 
 
 if __name__ == '__main__':

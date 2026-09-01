@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# Nav2 との閉ループ検証。
+#
+#   ./run_nav2.sh [out_dir] [duration_s]
+#
+# 位置推定だけを差し替えて (LOC)、同じ world・同じ地図・同じ目標列で走らせる。
+# 航法スタックの設定は 3 条件で完全に同一なので、差は位置推定に帰属する。
+#
+# 環境変数:
+#   LOC        ofl (既定) / amcl / gt / amcl_ofl  … map->odom を出すのは誰か
+#              amcl_ofl は「OFL で初期姿勢を与え、以降は AMCL が追う」構成
+#              (ofl_node は TF を出さず /initialpose だけを出す)
+#   DYNAMIC    1 で地図に無い動く障害物を置く
+#   KIDNAP_AT  この秒数で瞬間移動させる
+#   IMAGE      Gazebo Classic + gazebo_ros + nav2 を持つ docker イメージ
+#   OFL_ARGS   ofl_node への追加パラメータ
+#   OMP_NUM_THREADS  位置推定の相関に使うスレッド数 (既定 6)
+set -eo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PKG="$(cd "${HERE}/.." && pwd)"
+OUT="${1:-${HERE}/out_nav2}"
+DURATION="${2:-300}"
+IMAGE="${IMAGE:-bac_gazebo_runtime:humble}"
+LOC="${LOC:-ofl}"
+
+mkdir -p "${OUT}"
+DYNFLAG=""
+[ "${DYNAMIC:-0}" = "1" ] && DYNFLAG="--dynamic"
+# shellcheck disable=SC2086
+python3 "${HERE}/make_env.py" "${OUT}/env" ${DYNFLAG}
+
+docker run --rm --network none \
+    -v "${PKG}:/ws/src/oriented_field_localization:ro" \
+    -v "${OUT}:/out" \
+    -e "DURATION=${DURATION}" -e "KIDNAP_AT=${KIDNAP_AT:-}" \
+    -e "LOC=${LOC}" -e "DYNAMIC=${DYNAMIC:-0}" \
+    -e "OFL_ARGS=${OFL_ARGS:-}" -e "OMP_NUM_THREADS=${OMP_NUM_THREADS:-6}" \
+    -e "DUMP_COSTMAP=${DUMP_COSTMAP:-0}" \
+    --entrypoint /bin/bash "${IMAGE}" -lc '
+set -eo pipefail
+source /opt/ros/humble/setup.bash
+cd /ws
+colcon build --packages-select oriented_field_localization \
+    --cmake-args -DCMAKE_BUILD_TYPE=Release > /out/build.log 2>&1
+source install/setup.bash
+export GAZEBO_MODEL_PATH=/usr/share/gazebo-11/models:${GAZEBO_MODEL_PATH:-}
+SIM=/ws/src/oriented_field_localization/sim
+PARAMS=${SIM}/nav2_params.yaml
+
+gzserver --verbose -s libgazebo_ros_init.so -s libgazebo_ros_factory.so \
+    /out/env/office.world > /out/gzserver.log 2>&1 &
+sleep 8
+
+URDF=${SIM}/models/robot.urdf
+ros2 run robot_state_publisher robot_state_publisher "${URDF}" \
+    --ros-args -p use_sim_time:=true > /out/rsp.log 2>&1 &
+sleep 2
+read -r SX SY SYAW < <(python3 -c "import json;s=json.load(open(\"/out/env/route.json\"))[\"start\"];print(s[0],s[1],s[2])")
+ros2 run gazebo_ros spawn_entity.py -file "${URDF}" -entity ofl_bot \
+    -x "${SX}" -y "${SY}" -z 0.10 -Y "${SYAW}" > /out/spawn.log 2>&1
+sleep 3
+
+# ---- 位置推定 (ここだけが条件で変わる) ----
+LOC_NODES="map_server"
+case "${LOC}" in
+  ofl)
+    # shellcheck disable=SC2086
+    ros2 run oriented_field_localization ofl_node --ros-args \
+        -p use_sim_time:=true -p map_yaml_path:=/out/env/office.yaml \
+        -p auto_localize:=true -p tf_mode:=map_to_odom \
+        -p max_range:=10.0 -p margin_pixels:=284 \
+        ${OFL_ARGS} > /out/loc.log 2>&1 &
+    ;;
+  amcl)
+    LOC_NODES="map_server, amcl"
+    ros2 run nav2_amcl amcl --ros-args --params-file "${PARAMS}" \
+        -r __node:=amcl -p use_sim_time:=true \
+        -p initial_pose.x:="${SX}" -p initial_pose.y:="${SY}" \
+        -p initial_pose.z:=0.0 -p initial_pose.yaw:="${SYAW}" > /out/loc.log 2>&1 &
+    ;;
+  gt)
+    python3 ${SIM}/gt_tf_node.py --ros-args -p use_sim_time:=true > /out/loc.log 2>&1 &
+    ;;
+  amcl_ofl)
+    # AMCL には初期姿勢を与えない。OFL が最初に採択した姿勢を /initialpose へ
+    # 流し、そこから AMCL が追う (publish_initialpose の実運用経路)
+    LOC_NODES="map_server, amcl"
+    ros2 run nav2_amcl amcl --ros-args --params-file "${PARAMS}" \
+        -r __node:=amcl -p use_sim_time:=true \
+        -p set_initial_pose:=false > /out/loc.log 2>&1 &
+    # shellcheck disable=SC2086
+    ros2 run oriented_field_localization ofl_node --ros-args \
+        -p use_sim_time:=true -p map_yaml_path:=/out/env/office.yaml \
+        -p auto_localize:=true -p tf_mode:=none -p publish_initialpose:=true \
+        -p max_range:=10.0 -p margin_pixels:=284 \
+        ${OFL_ARGS} > /out/ofl_init.log 2>&1 &
+    ;;
+  *) echo "unknown LOC=${LOC}" >&2; exit 2;;
+esac
+
+# ---- Nav2 ----
+ros2 run nav2_map_server map_server --ros-args --params-file "${PARAMS}" \
+    -r __node:=map_server -p use_sim_time:=true \
+    -p yaml_filename:=/out/env/office.yaml > /out/map_server.log 2>&1 &
+ros2 run nav2_planner planner_server --ros-args --params-file "${PARAMS}" \
+    -r __node:=planner_server -p use_sim_time:=true > /out/planner.log 2>&1 &
+ros2 run nav2_controller controller_server --ros-args --params-file "${PARAMS}" \
+    -r __node:=controller_server -p use_sim_time:=true > /out/controller.log 2>&1 &
+ros2 run nav2_behaviors behavior_server --ros-args --params-file "${PARAMS}" \
+    -r __node:=behavior_server -p use_sim_time:=true > /out/behavior.log 2>&1 &
+ros2 run nav2_bt_navigator bt_navigator --ros-args --params-file "${PARAMS}" \
+    -r __node:=bt_navigator -p use_sim_time:=true > /out/bt.log 2>&1 &
+sleep 5
+ros2 run nav2_lifecycle_manager lifecycle_manager --ros-args \
+    -r __node:=lifecycle_manager_localization -p use_sim_time:=true \
+    -p autostart:=true -p node_names:="[${LOC_NODES}]" > /out/lm_loc.log 2>&1 &
+sleep 3
+ros2 run nav2_lifecycle_manager lifecycle_manager --ros-args \
+    -r __node:=lifecycle_manager_navigation -p use_sim_time:=true \
+    -p autostart:=true \
+    -p node_names:="[controller_server, planner_server, behavior_server, bt_navigator]" \
+    > /out/lm_nav.log 2>&1 &
+sleep 8
+
+# ---- 動的障害物 ----
+DYNARG=""
+if [ "${DYNAMIC}" = "1" ]; then
+  python3 ${SIM}/obstacle_node.py --dynamic /out/env/dynamic.json \
+      --ros-args -p use_sim_time:=true > /out/obstacles.log 2>&1 &
+  DYNARG="--dynamic /out/env/dynamic.json"
+  sleep 2
+fi
+
+# ---- 走行と記録 ----
+KID=""
+[ -n "${KIDNAP_AT}" ] && KID="--kidnap-at ${KIDNAP_AT}"
+CM=""
+[ "${DUMP_COSTMAP:-0}" = "1" ] && CM="--dump-costmap"
+HARD=$(python3 -c "print(int(${DURATION} * 3 + 300))")
+# shellcheck disable=SC2086
+timeout -k 20 "${HARD}" python3 ${SIM}/nav2_drive_node.py \
+    --route /out/env/route.json --map /out/env/office.yaml \
+    --out /out/run.csv --duration "${DURATION}" ${DYNARG} ${KID} ${CM} \
+    --ros-args -p use_sim_time:=true > /out/drive.log 2>&1 || true
+
+for p in gzserver ofl_node amcl map_server planner_server controller_server \
+         behavior_server bt_navigator lifecycle_manager robot_state_publisher \
+         obstacle_node.py gt_tf_node.py; do
+  pkill -f "${p}" 2>/dev/null || true
+done
+sleep 2
+exit 0
+'
+echo
+python3 "${HERE}/summarize_nav2.py" "${OUT}/run.csv" || true

@@ -98,7 +98,11 @@
       <ros><namespace>/</namespace><remapping>odom:=ground_truth</remapping></ros>
       <body_name>base_link</body_name>
       <frame_name>world</frame_name>
-      <update_rate>20.0</update_rate>
+      <!-- 記録は 20 Hz だが、真値が 20 Hz だと最大 50 ms 古い真値と比べることに
+           なり、0.5 m/s では 0.025 m の見かけの誤差が乗る (誤差の測定下限が
+           推定そのものの誤差と同じ桁になってしまう)。50 Hz にして下限を
+           0.01 m へ下げる。 -->
+      <update_rate>50.0</update_rate>
       <gaussian_noise>0.0</gaussian_noise>
     </plugin>
   </gazebo>

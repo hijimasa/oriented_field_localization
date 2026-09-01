@@ -18,8 +18,11 @@
 | BBS (Olson/Hess 型 分枝限定相関) | 62.5% | 0.013 / 0.037 |
 | Radon サイノグラム法 (姉妹パッケージの最良構成) | 85.7% | 0.060 / 0.084 |
 
-Gazebo での連続走行 (240 秒・121 m) では**位置誤差 中央 0.039 m / 0.5 m 以内 99.7%**、
+Gazebo での連続走行 (240 秒・121 m) では**位置誤差 中央 0.037 m / 0.5 m 以内 99.8%**、
 kidnap から **0.6 秒で復帰**します ([docs/simulation.md](docs/simulation.md))。
+**Nav2 と閉ループ**に組み、地図に無い動く障害物を入れた 300 秒の走行 4 回では、位置誤差が
+0.5 m を超えていた時間の合計が毎回 **0.1 -- 0.6 秒**でした (同条件の AMCL は 3 回中 2 回で
+22 秒と 106 秒。[docs/nav2_closed_loop.md](docs/nav2_closed_loop.md))。
 
 成功判定は「位置誤差 < 1.0 m かつ 角度誤差 < 15 度」。McNemar で BBS 比
 p = 1.6e-278。TRACK は**窓の内側なら事前誤差の大きさによらず引き込み**、
@@ -116,8 +119,10 @@ ros2 service call \
 | `track_angle_window_deg` | `30` | TRACK の角度探索幅 `[deg]` |
 | `track_after_accepts` | `3` | 連続採択がこの回数で TRACK へ移る |
 | `max_consecutive_rejects` | `5` | 連続棄却がこの回数で GLOBAL へ戻る |
-| `track_max_wfrac` | `0.35` | TRACK 中に壁へ載らない点の割合がこれを超えたら棄却。**誤ロックの検出はこれが担う** |
+| `track_max_wfrac` | `0.35` | TRACK 中に壁へ載らない点の割合がこれを超えたら棄却。**誤ロックの検出はこれが担う**。地図に無い障害物がある環境では `0.45`--`0.50` |
 | `use_odometry` | `true` | `/odom` で事前姿勢を伝播する |
+| `publish_initialpose` | `true` | 初回ロック (と追跡喪失後の再取得) で `/initialpose` を出す |
+| `initialpose_repeat` | `5` | `/initialpose` を出し直す回数。**購読者が居ない間は消費しない** |
 | `tf_mode` | `none` | `none` / `map_to_odom` (REP-105) / `map_to_base` |
 
 重要な不変条件:
@@ -153,22 +158,42 @@ ROS 非依存の単体テスト (19 項目) は、パラメータの不変条件
 
 ## Gazebo での連続走行検証
 
-Gazebo Classic の中でロボットを走らせ、オフラインでは測れないもの (ドリフト下での
-追従、kidnap からの復帰、TRACK の寄与) を見ます。
+Gazebo Classic の中でロボットを走らせます。**開ループ** (制御は真値、位置推定は
+受け身の観測者) と**閉ループ** (Nav2 が位置推定の出力だけで走る) の両方を回します。
 
 ```bash
-./sim/run_sim.sh out 240
+./sim/run_sim.sh  out 240                        # 開ループ
 KIDNAP_AT=120 ./sim/run_sim.sh out_kidnap 240
+./sim/run_nav2.sh out_nav2 300                   # 閉ループ (Nav2)
+LOC=amcl DYNAMIC=1 ./sim/run_nav2.sh out_amcl 300   # AMCL + 動く障害物と比較
 ```
 
 壁の定義 1 つから world と占有格子の両方を生成するので、world と地図がずれません。
-測定と限界は [docs/simulation.md](docs/simulation.md)、環境の作りは
+測定と限界は [docs/simulation.md](docs/simulation.md) (開ループ) と
+[docs/nav2_closed_loop.md](docs/nav2_closed_loop.md) (閉ループ)、環境の作りは
 [sim/README.md](sim/README.md)。
 
-**この検証で誤ロックを検出できない欠陥が見つかり、修正しました。**跳び判定だけでは、
-いったん誤った場所へ乗ると以後の事前姿勢もそこから出るので「跳んでいない」と見えて
-しまい、原理的に検出できません。事前姿勢に依存しない WFRAC を足して復帰するように
-なりました (復帰せず → 0.6 秒)。
+**この検証で 2 つの欠陥が見つかり、修正しました。**
+
+1. **跳び判定だけでは誤ロックを検出できない。**いったん誤った場所へ乗ると以後の
+   事前姿勢もそこから出るので「跳んでいない」と見えてしまい、原理的に検出できません。
+   事前姿勢に依存しない WFRAC を足して復帰するようになりました (復帰せず → 0.6 秒)。
+2. **`/initialpose` の引き継ぎが起動レースで失われる。**初回ロックの 1 回だけ
+   volatile で publish していたため、購読側 (AMCL) の activate が後になると黙って
+   捨てられていました。`initialpose_repeat` 回だけ出し直すようにしました。
+
+閉ループで分かった要点:
+
+- **手法を分けるのは精度ではなく「間違っている時間の長さ」です。**瞬間の最大誤差は
+  どちらも 8 -- 14 m 出ますが、誤差が 0.5 m を超えていた合計時間は本手法が 8 回の走行
+  すべてで 1 秒未満、AMCL は動的障害物で 3 回中 2 回 (22 秒・106 秒)、kidnap では
+  2 回中 2 回とも最後まで戻りませんでした
+- **大域位置推定の跳びは無料ではありません。**局所 costmap は odom フレームにあるので、
+  跳ぶと全軌道が無効になり `follow_path` が abort して 2.5 秒止まります
+- **`track_max_wfrac` の既定 0.35 は静的な地図に対する値です。**地図に無い障害物が
+  あると正常時の WFRAC が 0.50 近くまで上がり、既定のままだと正常な観測を 300 秒に
+  50 回棄却します。その環境では 0.45 -- 0.50 にします (誤差は変わりませんが、無駄な
+  GLOBAL のやり直しが 15-18 回から 3-9 回に減ります)
 
 ## 評価ハーネス
 
@@ -208,8 +233,12 @@ oriented_field_localization/
 ├── sim/                             # Gazebo での連続走行検証
 │   ├── make_env.py                  # 壁の定義から world・地図・経路を生成
 │   ├── models/robot.urdf
-│   ├── drive_node.py                # 経路追従 (真値) と誤差記録
-│   └── run_sim.sh
+│   ├── obstacle_node.py             # 地図に無い動く障害物
+│   ├── drive_node.py                # [開ループ] 経路追従 (真値) と誤差記録
+│   ├── run_sim.sh                   # [開ループ]
+│   ├── nav2_drive_node.py           # [閉ループ] 目標の送信と航法込みの記録
+│   ├── nav2_params.yaml             # [閉ループ] Nav2 の設定 (全条件で同一)
+│   └── run_nav2.sh                  # [閉ループ]
 ├── eval/                            # BBS との比較ハーネス
 │   ├── make_scans.cpp               # 姿勢サンプリング + 外乱スキャン生成
 │   ├── ofl_eval.cpp                 # 本手法の評価器
@@ -221,7 +250,8 @@ oriented_field_localization/
 └── docs/
     ├── design.md                    # 設計と既知の制約
     ├── benchmark.md                 # BBS / Radon との比較
-    ├── simulation.md                # Gazebo での連続走行検証
+    ├── simulation.md                # Gazebo での連続走行検証 (開ループ)
+    ├── nav2_closed_loop.md          # Nav2 との閉ループと動的障害物
     └── en/                          # 上記の英語版
 ```
 

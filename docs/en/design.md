@@ -113,7 +113,11 @@ area; TRACK scales with the window only. On the largest map (52 x 50 m) GLOBAL m
   solution ever looks like a jump. A wrong lock is self-consistent, so a jump gate cannot catch it in
   principle (measured with a Gazebo kidnap: with the jump gate alone it never recovered in 120 s —
   see [simulation.md](simulation.md)). WFRAC never consults the prior, so it jumps at a wrong lock
-  (median 0.000 when healthy against 0.74 at the wrong lock)
+  (median 0.000 when healthy against 0.74 at the wrong lock).
+  **The threshold of 0.35 comes from a separation measured in a still world.** With unmapped moving
+  obstacles in view the healthy WFRAC itself rises to nearly 0.50 and the default leaves no margin
+  (measured: 50 rejections in 300 s — see [nav2_closed_loop.md](nav2_closed_loop.md)). Use
+  `0.45`--`0.50` in such environments
 - After enough consecutive rejects the prior is discarded and the node returns to GLOBAL
   (kidnap recovery)
 - Calling `~/global_localization` drops the tracking state and restarts from GLOBAL

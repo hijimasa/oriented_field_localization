@@ -18,6 +18,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import sys
 
 import rclpy
@@ -188,7 +189,11 @@ class Driver(Node):
             wr.writerows(self.rows)
         self.get_logger().info(f'wrote {self.out_csv} ({len(self.rows)} rows, '
                                f'{self.laps} laps)')
-        rclpy.shutdown()
+        # コールバックから rclpy.shutdown() を呼んでも spin が抜けないことがあり、
+        # その場合プロセスはハード timeout まで残る。出力は閉じてあるので落とす。
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 def main():

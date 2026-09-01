@@ -58,7 +58,15 @@
     auto_localize: false         # true でスキャンごとに GLOBAL を自動実行
                                  # (TRACK 中はこれに関係なく毎スキャン走る)
     publish_initialpose: true    # GLOBAL から初めて採択したときだけ /initialpose
-                                 # へ流す (AMCL への引き継ぎ)。以降は ~/pose のみ
+                                 # へ流す (AMCL への引き継ぎ)。以降は ~/pose のみ。
+                                 # 追跡を失って GLOBAL へ戻った後の再取得でも出る
+    initialpose_repeat: 5        # /initialpose を 1 秒間隔でこの回数まで出し直す。
+                                 # 1 回きりだと、購読側の activate がこちらの初回
+                                 # ロックより後になったときに黙って失われる
+                                 # (実測: AMCL の activate は初回ロックの 6 秒後)。
+                                 # **購読者が居ない間は回数を消費せずに待つ**ので、
+                                 # 起動順に依存しない
+    initialpose_wait_s: 60       # 購読者を待つ上限 [s]。誰も来なければ諦める
     tf_mode: "none"              # none / map_to_odom / map_to_base
                                  # map_to_odom は REP-105 準拠 (use_odometry 必須)
     transform_tolerance: 0.2     # TF を先付けする時間 [s]

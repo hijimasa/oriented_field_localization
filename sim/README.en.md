@@ -3,23 +3,52 @@
 English | [日本語](README.md)
 
 The offline harness (`../eval/`) only evaluates one scan at a time. Here the robot drives inside
-Gazebo Classic and the localizer is evaluated as a **passive observer**, which shows three things
-offline cannot:
+Gazebo Classic, which shows what offline cannot.
+
+**Open loop** (`run_sim.sh`, control on ground truth) — the localizer as a passive observer
 
 - following while odometry drift accumulates
 - recovery from a kidnap (teleport)
 - what TRACK actually buys (against running GLOBAL on every scan)
 
+**Closed loop** (`run_nav2.sh`, Nav2 drives on the localizer's output) — what the error does to navigation
+
+- what a localization jump does to control, the costmaps and planning
+- degradation with unmapped moving obstacles (against AMCL)
+- whether the whole navigation stack recovers from a kidnap
+
+Results are in [../docs/simulation.md](../docs/simulation.md) (open loop) and
+[../docs/nav2_closed_loop.md](../docs/nav2_closed_loop.md) (closed loop).
+
 ## Layout
 
 ```text
 sim/
-├── make_env.py        generates the world SDF, occupancy grid, and route from one wall definition
-├── models/robot.urdf  differential drive + 2D LiDAR + ground-truth plugin
-├── drive_node.py      path following (on ground truth) and error recording
-├── summarize_run.py   summary of run.csv
-└── run_sim.sh         runs all of the above inside Docker
+├── make_env.py         world SDF, occupancy grid and route from one wall definition
+│                       (--dynamic puts unmapped moving obstacles in the world only)
+├── models/robot.urdf   differential drive + 2D LiDAR + ground-truth plugin
+├── obstacle_node.py    drives the dynamic obstacles along fixed trajectories
+├── gt_tf_node.py       map -> odom from ground truth: a "perfect localizer"
+│
+├── drive_node.py       [open loop] path following (on ground truth) and error recording
+├── summarize_run.py    [open loop] summary of run.csv
+├── run_sim.sh          [open loop] runs the above inside Docker
+│
+├── nav2_params.yaml    [closed loop] Nav2 configuration (identical in every condition)
+├── nav2_drive_node.py  [closed loop] goal dispatch and recording, navigation included
+├── summarize_nav2.py   [closed loop] summary of one run
+├── compare_nav2.py     [closed loop] several runs in one table
+├── costmap_phantoms.py [closed loop] counts phantom obstacles burned into the costmap
+└── run_nav2.sh         [closed loop] runs the above inside Docker
 ```
+
+### Open loop and closed loop
+
+`run_sim.sh` measures the localizer as a **passive observer** (control runs on ground truth).
+`run_nav2.sh` has **Nav2 drive on the localizer's output alone**, so a bad estimate bends the
+path, the costmaps and the tracking with it. Both are needed: without the first you cannot
+measure the localizer in isolation, and without the second you cannot measure what its error
+does to navigation.
 
 ### One source of truth for the walls
 
@@ -53,25 +82,62 @@ so offsetting the sensor would add a systematic bias against ground truth (base_
 
 ## Running
 
+### Open loop (the localizer alone)
+
 ```bash
 ./sim/run_sim.sh out 240          # 240 s continuous drive
 KIDNAP_AT=120 ./sim/run_sim.sh out_kidnap 240      # teleport at 120 s
 OFL_ARGS="-p enable_track:=false" ./sim/run_sim.sh out_notrack 240   # no TRACK
 ```
 
+### Closed loop (Nav2 drives on the localizer's output)
+
+```bash
+./sim/run_nav2.sh out_nav2 300                     # OFL, static
+LOC=amcl ./sim/run_nav2.sh out_amcl 300            # swap in AMCL
+LOC=gt   ./sim/run_nav2.sh out_gt 300              # ground truth (ceiling of the stack)
+DYNAMIC=1 ./sim/run_nav2.sh out_dyn 300            # unmapped moving obstacles
+KIDNAP_AT=150 ./sim/run_nav2.sh out_kid 300        # kidnap in the closed loop
+DUMP_COSTMAP=1 ./sim/run_nav2.sh out_cm 300        # also save the final global costmap
+LOC=amcl_ofl ./sim/run_nav2.sh out_seed 300        # OFL seeds the initial pose, AMCL tracks
+```
+
+To put several runs side by side:
+
+```bash
+python3 sim/compare_nav2.py OFL=out_nav2 AMCL=out_amcl GT=out_gt
+```
+
+**Nothing but the localizer (`LOC`) changes between conditions.** Changing anything else mixes
+"difference in navigation" into "difference in localization".
+
+### Dynamic obstacles
+
+`make_env.py --dynamic` puts three 40 cm walkers and one 70 x 50 cm cart **into the world only**
+(they are never rasterized into the occupancy grid). `obstacle_node.py` moves them back and forth
+through `/gazebo/set_entity_state`. Their poses are an **explicit function of simulation time**, so
+the trajectories are identical no matter which localizer is under test (driving them with velocity
+commands would let physics jitter change the trajectory run to run, mixing the obstacles into the
+comparison). The links are `kinematic`, so teleporting them does not break physics and they still
+collide.
+
 Needs an image with Gazebo Classic and `gazebo_ros` (set `IMAGE`; default
 `bac_gazebo_runtime:humble`). No network required (it runs with `--network none`).
 
-Outputs are `out/run.csv` (a 20 Hz time series) and `out/{gzserver,ofl,drive}.log`.
-`summarize_run.py` reports the median, 95th percentile and maximum error, the fraction within 0.5 m,
-and the recovery time after a kidnap.
+Outputs are `out/run.csv` (a 20 Hz time series) plus each process's log; closed-loop runs also write
+`run_events.json` (goals sent and their outcome). Summarize with `summarize_run.py` /
+`summarize_nav2.py`.
 
 ## Notes
 
-- **The real-time factor is not 1.0.** With ODE at 500 iter/s and a 360-ray sensor this machine runs
-  at about 0.4x. The localizer keeps up with the sensor, but check the factor before reading
-  "milliseconds per scan" as deployment headroom.
-- The world is static. No dynamic obstacles. The offline harness covers stationary phantoms with its
-  `phantom*` conditions, but **continuously moving obstacles are measured nowhere**.
+- **Check the real-time factor.** With ODE at 500 iter/s and a 360-ray sensor, running one at a time
+  gives 1.00x (every closed-loop condition did). Running several at once drops it. `run_nav2.sh`
+  records wall-clock time in the CSV and `summarize_nav2.py` reports the factor. **Check it before
+  reading "milliseconds per scan" as deployment headroom.**
 - Setting `real_time_update_rate=0` ("as fast as possible") runs hundreds of times faster than real
   time and nothing can keep up; `make_env.py` pins it to 500 iter/s.
+- **The dynamic obstacles do not move when pushed** (`kinematic`). Real people and carts do, so the
+  behaviour when wedged is harsher here than in reality.
+- **DWB is not allowed to reverse** (`min_vel_x: 0.0`). Nose into a corner and it can only rotate
+  out. Distance driven and "fraction of time moving" carry a lot of navigation-side accident — do
+  not read them as a localization comparison.
