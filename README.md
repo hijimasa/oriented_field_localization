@@ -19,8 +19,9 @@ refinement, no multi-scan accumulation, and no internal odometry.
 | BBS (Olson/Hess branch-and-bound correlative matching) | 62.5% | 0.013 / 0.037 |
 | Radon sinogram method (sibling package, best configuration) | 85.7% | 0.060 / 0.084 |
 
-In a continuous Gazebo drive (240 s, 121 m) it holds a **median error of 0.037 m with 99.8% within
-0.5 m**, and recovers from a kidnap in **0.6 s** ([docs/en/simulation.md](docs/en/simulation.md)).
+In a continuous Gazebo drive (240 s, 121 m) it holds a **median error of 0.04-0.06 m with 100%
+within 0.5 m across three runs**, and recovers from a kidnap in **0.7 s**
+([docs/en/simulation.md](docs/en/simulation.md)).
 **Closed-loop with Nav2**, with unmapped moving obstacles, its total time above 0.5 m of error over
 a 300 s drive was **0.1 -- 0.6 s in each of four runs** (AMCL under the same conditions went badly
 wrong in 2 of 3 runs, for 22 s and 106 s;
@@ -117,12 +118,14 @@ Set `auto_localize: true` to run on every incoming scan.
 | `peaks_per_angle` | `8` | peaks kept per angle at the coarse level |
 | `candidate_pool_size` | `15` | candidates retained |
 | `wfrac_margin` | `1.05` | re-select by WFRAC only when scores are this close; 0 disables |
-| `global_min_margin` | `1.0` | do not publish if top1/top2 is below this |
+| `global_min_margin` | `1.05` | do not publish if top1/top2 is below this. **Needed whenever `max_accept_jump_m` is tightened** — that raises the number of GLOBAL restarts, each of which can draw an ambiguous solution |
 | `enable_track` | `true` | false stays in GLOBAL forever |
 | `track_search_m` | `3.0` | TRACK position search radius `[m]` |
 | `track_angle_window_deg` | `30` | TRACK angle search window `[deg]` |
 | `track_after_accepts` | `3` | consecutive accepts before switching to TRACK |
 | `max_consecutive_rejects` | `5` | consecutive rejects before falling back to GLOBAL |
+| `max_accept_jump_m` | `0.5` | drop a TRACK solution that jumped further than this from the prior `[m]`. **Well above the per-scan prior error, well below the distance to an ambiguous solution** (0.05 m of real motion at 0.5 m/s and 10 Hz) |
+| `max_accept_yaw_deg` | `20.0` | the same in `[deg]`; 0 disables |
 | `track_max_wfrac` | `0.35` | reject in TRACK when the fraction of points off the walls exceeds this. **This is what detects a wrong lock.** Use `0.45`--`0.50` where unmapped obstacles are expected |
 | `use_odometry` | `true` | propagate the prior with `/odom` |
 | `publish_initialpose` | `true` | publish `/initialpose` on the first lock (and on re-acquisition after losing track) |
@@ -196,6 +199,12 @@ What the closed loop showed:
   came back in 2 of 2 kidnaps
 - **A global localizer's jumps are not free.** The local costmap lives in the odom frame, so a jump
   invalidates every trajectory, aborts `follow_path`, and costs 2.5 s of standing still
+- **The two acceptance thresholds were recalibrated and their defaults changed**
+  (`max_accept_jump_m` 2.0 -> 0.5, `global_min_margin` 1.0 -> 1.05). The median does not move (it
+  sits inside the 0.037-0.058 m run-to-run spread), but the maximum error goes from 1.4 m to
+  0.33-0.46 m and the time above 0.5 m from 0.2 s to zero. **They have to change together** —
+  tightening the jump gate alone raises the number of GLOBAL restarts, each a lottery ticket on an
+  ambiguous solution
 - **The default `track_max_wfrac` of 0.35 is a value for a static map.** With unmapped obstacles the
   healthy WFRAC rises to nearly 0.50, and the default rejects 50 perfectly good observations per
   300 s. Use 0.45 -- 0.50 there: the error is unchanged, but needless GLOBAL restarts drop from

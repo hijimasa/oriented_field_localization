@@ -18,8 +18,8 @@
 | BBS (Olson/Hess 型 分枝限定相関) | 62.5% | 0.013 / 0.037 |
 | Radon サイノグラム法 (姉妹パッケージの最良構成) | 85.7% | 0.060 / 0.084 |
 
-Gazebo での連続走行 (240 秒・121 m) では**位置誤差 中央 0.037 m / 0.5 m 以内 99.8%**、
-kidnap から **0.6 秒で復帰**します ([docs/simulation.md](docs/simulation.md))。
+Gazebo での連続走行 (240 秒・121 m) では**位置誤差 中央 0.04-0.06 m / 0.5 m 以内 100%
+(3 走行)**、kidnap から **0.7 秒で復帰**します ([docs/simulation.md](docs/simulation.md))。
 **Nav2 と閉ループ**に組み、地図に無い動く障害物を入れた 300 秒の走行 4 回では、位置誤差が
 0.5 m を超えていた時間の合計が毎回 **0.1 -- 0.6 秒**でした (同条件の AMCL は 3 回中 2 回で
 22 秒と 106 秒。[docs/nav2_closed_loop.md](docs/nav2_closed_loop.md))。
@@ -113,12 +113,14 @@ ros2 service call \
 | `peaks_per_angle` | `8` | 粗段で角度ごとに保持するピーク数 |
 | `candidate_pool_size` | `15` | 残す候補数 |
 | `wfrac_margin` | `1.05` | 拮抗時に WFRAC で選び直す比率。0 で無効 |
-| `global_min_margin` | `1.0` | top1/top2 がこれ未満なら publish しない |
+| `global_min_margin` | `1.05` | top1/top2 がこれ未満なら publish しない。**`max_accept_jump_m` を絞るならこれも要る** (GLOBAL のやり直しが増え、曖昧解を引きやすくなるため) |
 | `enable_track` | `true` | false で常に GLOBAL |
 | `track_search_m` | `3.0` | TRACK の位置探索半径 `[m]` |
 | `track_angle_window_deg` | `30` | TRACK の角度探索幅 `[deg]` |
 | `track_after_accepts` | `3` | 連続採択がこの回数で TRACK へ移る |
 | `max_consecutive_rejects` | `5` | 連続棄却がこの回数で GLOBAL へ戻る |
+| `max_accept_jump_m` | `0.5` | TRACK で事前姿勢からこれ以上跳んだ解は捨てる `[m]`。**1 スキャンの事前誤差より十分大きく、曖昧解までの距離より小さく**取る (0.5 m/s・10 Hz なら実移動 0.05 m) |
+| `max_accept_yaw_deg` | `20.0` | 同上 `[deg]`。0 で無効 |
 | `track_max_wfrac` | `0.35` | TRACK 中に壁へ載らない点の割合がこれを超えたら棄却。**誤ロックの検出はこれが担う**。地図に無い障害物がある環境では `0.45`--`0.50` |
 | `use_odometry` | `true` | `/odom` で事前姿勢を伝播する |
 | `publish_initialpose` | `true` | 初回ロック (と追跡喪失後の再取得) で `/initialpose` を出す |
@@ -190,6 +192,11 @@ LOC=amcl DYNAMIC=1 ./sim/run_nav2.sh out_amcl 300   # AMCL + 動く障害物と�
   2 回中 2 回とも最後まで戻りませんでした
 - **大域位置推定の跳びは無料ではありません。**局所 costmap は odom フレームにあるので、
   跳ぶと全軌道が無効になり `follow_path` が abort して 2.5 秒止まります
+- **採否の 2 つのしきい値を再校正し、既定値を変えました** (`max_accept_jump_m` 2.0 -> 0.5、
+  `global_min_margin` 1.0 -> 1.05)。中央値は動きませんが (走行ごとに 0.037-0.058 m と
+  ばらつく範囲の中)、最大誤差が 1.4 m -> 0.33-0.46 m、0.5 m を超えていた時間が
+  0.2 秒 -> 0 秒になります。**2 つは一緒に変える必要があります** — 跳び判定だけ絞ると
+  GLOBAL のやり直しが増え、その 1 回ごとが曖昧解を引く「くじ」になります
 - **`track_max_wfrac` の既定 0.35 は静的な地図に対する値です。**地図に無い障害物が
   あると正常時の WFRAC が 0.50 近くまで上がり、既定のままだと正常な観測を 300 秒に
   50 回棄却します。その環境では 0.45 -- 0.50 にします (誤差は変わりませんが、無駄な

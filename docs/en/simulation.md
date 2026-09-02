@@ -2,7 +2,7 @@
 
 English | [日本語](../simulation.md)
 
-Measured: 2026-09-01 (re-measured 2026-09-02)
+Measured: 2026-09-01 (re-measured 2026-09-02, then again after the threshold recalibration)
 
 The offline harness ([benchmark.md](benchmark.md)) only evaluates one scan at a time. Here the
 robot drives for 240 s (about 121 m) inside Gazebo Classic, to see the **three things offline
@@ -30,24 +30,42 @@ The environment and how to run it are in [sim/README.md](../../sim/README.md).
 
 ## Results
 
+At the current defaults (`max_accept_jump_m: 0.5`, `global_min_margin: 1.05`). The
+baseline scenario was repeated three times and is given as a range.
+
 | Scenario | median | 95% | max | within 0.5 m | yaw median / max |
 |---|---:|---:|---:|---:|---:|
-| **Baseline (GLOBAL -> TRACK)** | **0.037 m** | 0.073 m | 1.43 m | **99.8%** | 0.32 / 31.4 deg |
-| No TRACK (GLOBAL every scan) | 0.065 m | 0.118 m | **19.09 m** | 97.8% | 0.55 / **179.4** deg |
-| Kidnap, before (to 120 s) | 0.051 m | 0.099 m | 11.77 m | 99.1% | 0.47 / 135.3 deg |
-| Kidnap, after (120-240 s) | 0.061 m | 0.063 m | 11.21 m | **99.6%** | 0.00 / 92.6 deg |
-| *reference: odometry alone* | *5.76 m* | — | *12.50 m* | — | — |
+| **Baseline (GLOBAL -> TRACK)**, x3 | **0.038 -- 0.058 m** | 0.072 -- 0.108 | **0.33 -- 0.46 m** | **100%** x3 | 0.4 / 36 deg |
+| No TRACK (GLOBAL every scan) | 0.059 m | 0.108 m | **18.99 m** | 99.2% | 0.50 / **179.3** deg |
+| Kidnap, before (to 120 s) | 0.056 m | 0.109 m | 0.42 m | **100%** | 0.50 / 36.3 deg |
+| Kidnap, after (120-240 s) | 0.070 m | 0.071 m | 11.26 m | 99.5% | 0.00 / 94.1 deg |
+| *reference: odometry alone* | *5.9 m* | — | *12.3 m* | — | — |
 
-121.7 m driven; 10 ms of compute per scan (about 10% duty against the 10 Hz sensor);
-23 ms with TRACK disabled.
+121.5 -- 121.7 m driven; 9 ms of compute per scan (about 10% duty against the 10 Hz
+sensor), 23 ms with TRACK disabled. Recovery from the kidnap takes 0.7 s.
 
-> The table above is the 2026-09-02 re-measurement. Ground truth was raised from 20 to 50 Hz,
-> lowering the floor of the error measurement from 0.025 to 0.010 m, so it was measured again.
-> **The 2026-09-01 measurement (median 0.039 m / 99.7% within 0.5 m / 0.6 s recovery / 19.45 m
-> and 179.8 deg without TRACK) reproduces.** The median barely moved when the floor was lowered,
-> so **0.037 m is the localizer's own error, not the floor of the measurement.**
+**The localizer holds 0.04-0.06 m while odometry alone drifts to 5.9 m.**
 
-**The localizer holds 0.04 m while odometry alone drifts to 5.8 m.**
+### Recalibrating the thresholds removed the tail
+
+At the previous defaults (`max_accept_jump_m: 2.0`, `global_min_margin: 1.0`) the same
+drive gave **the same median with a much longer tail**.
+
+| | median (x2) | max (x2) | time above 0.5 m | excursions |
+|---|---|---|---:|---:|
+| previous defaults | 0.037 / 0.058 m | 1.43 / 1.40 m | 0.2 s | 3 -- 4 |
+| **current defaults** | 0.038 -- 0.058 m | **0.33 -- 0.46 m** | **0.0 s** | **0** |
+
+The pre-kidnap segment differs more: maximum 11.77 m -> **0.42 m**, within 0.5 m
+99.1% -> **100%**. **The median does not move** — it sits inside the 0.037 -- 0.058 m
+run-to-run spread. How the recalibration was arrived at, and why the two thresholds must
+be changed **together**, is in [nav2_closed_loop.md](nav2_closed_loop.md).
+
+> Ground truth is published at 50 Hz (raised from 20, lowering the floor of the error
+> measurement from 0.025 to 0.010 m). **The 2026-09-01 measurement (median 0.039 m / 99.7%
+> within 0.5 m / 0.6 s recovery / 19.45 m and 179.8 deg without TRACK) reproduces at the
+> defaults of the time.** The median barely moved when the floor was lowered, so **the
+> ~0.04 m is the localizer's own error, not the floor of the measurement.**
 
 ### TRACK earns its place
 
@@ -99,10 +117,10 @@ caught and recovered from in 0.7 s, so **wrong locks are not a kidnap-only pheno
   **read "10 ms per scan" against the factor** before treating it as deployment headroom.
 - **The world is static.** Moving obstacles and the closed loop with Nav2 are measured separately in
   [nav2_closed_loop.md](nav2_closed_loop.md).
-- **One environment, one robot, one speed profile.** All three scenarios were run twice (2026-09-01
-  and 09-02) with the same conclusions, but outliers such as the maximum error still deserve less
-  trust than the median. The closed-loop side repeats the static condition four times and finds the
-  excursion count varying between 0 and 2 ([nav2_closed_loop.md](nav2_closed_loop.md)).
+- **One environment, one robot, one speed profile.** The baseline scenario was run five times
+  (twice at the old defaults, three times at the current ones). **The median varies between runs
+  from 0.037 to 0.058 m**, so comparing single-run medians is meaningless. Settings show up in the
+  maximum error and the time spent above 0.5 m instead.
 - **Path following uses ground truth.** That isolates the localizer, but by the same token it does
   not measure the effect of localization error on navigation. That is measured in
   [nav2_closed_loop.md](nav2_closed_loop.md) (conclusion: the excursions themselves last under a

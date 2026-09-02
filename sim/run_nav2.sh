@@ -15,6 +15,7 @@
 #   IMAGE      Gazebo Classic + gazebo_ros + nav2 を持つ docker イメージ
 #   OFL_ARGS   ofl_node への追加パラメータ
 #   OMP_NUM_THREADS  位置推定の相関に使うスレッド数 (既定 6)
+#   RETRIES    Nav2 の起動に失敗したときの再試行回数 (既定 2)
 set -eo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,6 +31,7 @@ DYNFLAG=""
 # shellcheck disable=SC2086
 python3 "${HERE}/make_env.py" "${OUT}/env" ${DYNFLAG}
 
+run_once() {
 docker run --rm --network none \
     -v "${PKG}:/ws/src/oriented_field_localization:ro" \
     -v "${OUT}:/out" \
@@ -152,5 +154,32 @@ done
 sleep 2
 exit 0
 '
+}
+
+# Nav2 の lifecycle 起動は稀に失敗する。configure 自体は通っているのに
+# サービスの応答が Fast DDS で落ちることがあり
+#   [WARN] [planner_server.rclcpp]: failed to send response to
+#          /planner_server/change_state (timeout)
+# lifecycle_manager がそこで待ち続けて bt_navigator まで到達しない。
+# 25 走行に 1 回程度なので、空の run.csv を検出して回し直す。
+RETRIES="${RETRIES:-2}"
+attempt=0
+while : ; do
+  attempt=$((attempt + 1))
+  rm -f "${OUT}/run.csv"      # 前回の残りを成功と誤判定しない
+  run_once
+  # ヘッダのみ = 1 行なら失敗
+  if [ "$(wc -l < "${OUT}/run.csv" 2>/dev/null || echo 0)" -gt 1 ]; then
+    break
+  fi
+  if [ "${attempt}" -gt "${RETRIES}" ]; then
+    echo "run_nav2: ${attempt} 回試して起動できなかった (${OUT}/lm_nav.log を見ること)" >&2
+    break
+  fi
+  echo "run_nav2: Nav2 が起動しなかった (${attempt} 回目)。やり直す" >&2
+  sleep 5
+done
+
 echo
 python3 "${HERE}/summarize_nav2.py" "${OUT}/run.csv" || true
+exit 0

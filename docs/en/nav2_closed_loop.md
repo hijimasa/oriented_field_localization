@@ -14,6 +14,10 @@ the localizer's output alone** — which makes measurable what open loop cannot 
 - Whether the whole navigation stack, not just the localizer, recovers from a kidnap
 - Which method breaks first when **unmapped moving obstacles** are present
 
+This validation led to recalibrating the two acceptance thresholds
+(`max_accept_jump_m`, `global_min_margin`) and changing their defaults (Result 4).
+**The median does not move; the excursions almost disappear.**
+
 The conclusion first. **What separates the methods in a closed loop is not accuracy
 but how long they stay wrong.** Total time with position error above 0.5 m in a
 300 s run:
@@ -34,6 +38,14 @@ wrong.**
 The two are not exclusive. A configuration where **OFL supplies the initial pose and
 AMCL tracks** (`LOC=amcl_ofl`) was measured too, and drives as well as AMCL does without
 anyone handing it an initial pose.
+
+**The table above was measured at the then-current defaults.** After the threshold
+recalibration of Result 4, the static condition gives a maximum error of 0.33 -- 0.46 m
+with zero excursions (3 runs) and the dynamic one 0.33 / 0.10 m (2 runs): **the tail
+disadvantage against AMCL in a static world is essentially gone** (AMCL's maximum was
+0.213 m, against 0.16 -- 0.46 m here). What remains is the structural difference in
+step-to-step smoothness (discontinuity 95%: 0.050 m against 0.014 m — per-scan
+independent estimation against a recursive filter).
 
 ## Setup
 
@@ -67,6 +79,12 @@ below 0.09 m).
 
 What enters control is `map -> base`, and with the real motion removed — that is, the
 one-step change of the error vector `est - gt`. Every "discontinuity" below is that.
+
+> **Results 1 -- 3 were measured at the then-current defaults**
+> (`max_accept_jump_m: 2.0`, `global_min_margin: 1.0`). Both were recalibrated in
+> Result 4 and the defaults changed; at the current defaults the same drives show
+> almost no excursions (maximum error 0.33 -- 0.46 m over three static runs, zero
+> excursions).
 
 ## Result 1: static environment
 
@@ -247,6 +265,89 @@ wedged in a corner.
 In the run where **AMCL was wrong for 150 s, 412 cells in 53 blobs of nonexistent wall
 were left behind.** A localization failure persists not only as error at the time but
 **as degradation of the map afterwards.**
+
+## Result 4: recalibrating the two thresholds
+
+The excursions in Result 1 (a solution shifted 1.93 / 1.97 m along the corridor) passed
+**just inside** the then-current `max_accept_jump_m` of 2.0 m. The next scan, where the
+error grew to 3.50 m, was caught by the same gate (`TRACK reject (jump 3.50)`). At
+0.5 m/s and 10 Hz the real motion between scans is 0.05 m, so 2.0 m is a 40x margin.
+Tightening it should catch these.
+
+### Tightening works — and opens another hole
+
+`max_accept_jump_m: 0.5`, four static runs:
+
+| | excursions | total > 0.5 m | max error (4 runs) | GLOBAL re-acquisitions |
+|---|---:|---:|---|---|
+| 2.0 (then default) | 4 | 1.7 s | 3.48 / 3.76 / 0.18 / 0.14 m | 3 / 9 / 6 / 6 |
+| **0.5** | 1 | **0.1 s** | 5.85 / **0.15 / 0.13 / 0.13** m | 9 / 3 / 3 / 3 |
+
+Three runs came down to a 0.13 -- 0.15 m maximum. The mechanism is directly visible:
+runs that rejected jumps of 1.15 -- 3.35 m in the corridor at (18, 10.5) had no excursion
+afterwards. Dynamic obstacles (max 0.18 / 0.10 m) and kidnaps (recovery 0.6 -- 0.8 s, no
+failed goals) did not get worse.
+
+**But one run produced 5.85 m.** That run had zero jump rejections; the cause was
+different.
+
+```text
+t=284.5-284.9  TRACK reject (wfrac 0.36→0.53) -> GLOBAL
+t=285.01       GLOBAL accept (11.90, 10.15) margin 1.13   <- correct
+t=285.11       GLOBAL accept ( 7.65, 15.50) margin 1.02   <- 5.85 m off
+t=285.21       GLOBAL accept (11.90, 10.15) margin 1.32 -> TRACK
+```
+
+**Tightening the jump gate raises the number of TRACK rejections, and with it the number
+of GLOBAL restarts. Each restart is a lottery ticket on the ambiguity of a whole-map
+search.** The open loop showed the same thing.
+
+| open loop, 240 s | max error | GLOBAL restarts | GLOBAL accepts with margin < 1.05 |
+|---|---:|---:|---|
+| 2.0 (then default), 2 runs | 1.43 / 1.40 m | 6 / 12 | none / none |
+| 0.5 only, 3 runs | 0.39 / **11.85** / **6.28** m | 9 / 15 / 18 | none / **[1.02]** / **[1.01]** |
+
+**Exactly the runs that went badly wrong contain exactly one GLOBAL accept with a margin
+of 1.01 -- 1.02.** The runs with no excursion contain none. Across the eight static
+closed-loop runs, only 1 of 42 GLOBAL accepts had a margin below 1.05 — and it is the one
+that landed 5.85 m off (the other 41 were followed by errors under 0.1 m).
+
+### The two have to change together
+
+`global_min_margin` (do not publish if top1/top2 is below this) defaulted to 1.0, i.e.
+disabled. Setting it to 1.05 and applying both:
+
+| open loop, 240 s, 3 runs | median | max error | total > 0.5 m | excursions |
+|---|---|---|---:|---:|
+| 2.0 + 1.0 (then default) | 0.037 / 0.058 | 1.43 / 1.40 m | 0.2 s | 3 -- 4 |
+| 0.5 + 1.0 | 0.053 / 0.056 / 0.038 | 0.39 / 11.85 / 6.28 m | 0.0 s | 0 -- 2 |
+| **0.5 + 1.05 (current default)** | 0.038 / 0.058 / 0.039 | **0.33 / 0.46 / 0.42 m** | **0.0 s** | **0 / 0 / 0** |
+
+The closed loop agrees: zero excursions across three static runs (max 0.38 / 0.17 /
+0.16 m), two dynamic runs (0.33 / 0.10 m) and two kidnaps (0.8 s recovery each, no failed
+goals).
+
+**The median does not move at all.** Every setting falls inside the 0.037 -- 0.058 m
+run-to-run spread (the control run at the old default was the highest, at 0.058 m).
+**The settings show up only in the maximum error and the time spent above 0.5 m.**
+
+> Partway through this work the call was "make the jump gate a default and leave the
+> margin as a recommendation". That was **wrong**: the first creates the exposure the
+> second closes, so they have to go in together.
+
+### One side effect closed
+
+`global_min_margin > 1` could not be a default while a single `~/global_localization`
+request consumed exactly one scan under `auto_localize: false`: **a rejection would leave
+the caller with nothing at all.** A rejection on the margin gate now does not consume the
+request (it retries on the next scan), which closes that hole.
+
+### What a threshold cannot prevent
+
+With TRACK disabled and GLOBAL running every scan, **the 180-degree flipped wrong lock is
+not caught by the margin either** (the open loop still shows a maximum of 18.99 m /
+179.3 deg). A flipped solution scores highly in its own right, so its ratio to the runner-up
+is wide. Catching that is WFRAC's job, and it does not arise with TRACK enabled.
 
 ## A defect this validation found and fixed: the `/initialpose` handoff is lost to a startup race
 

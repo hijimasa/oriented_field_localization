@@ -135,12 +135,12 @@ public:
       declare_parameter("track_angle_window_deg", p.track_angle_window_deg);
 
     wfrac_margin_ = declare_parameter("wfrac_margin", 1.05);
-    global_min_margin_ = declare_parameter("global_min_margin", 1.0);
+    global_min_margin_ = declare_parameter("global_min_margin", 1.05);
     auto_localize_ = declare_parameter("auto_localize", false);
     enable_track_ = declare_parameter("enable_track", true);
     track_after_accepts_ = declare_parameter("track_after_accepts", 3);
     max_consecutive_rejects_ = declare_parameter("max_consecutive_rejects", 5);
-    max_accept_jump_m_ = declare_parameter("max_accept_jump_m", 2.0);
+    max_accept_jump_m_ = declare_parameter("max_accept_jump_m", 0.5);
     max_accept_yaw_deg_ = declare_parameter("max_accept_yaw_deg", 20.0);
     // 誤ロックの検出。跳び判定だけでは足りない: 追跡が誤った場所へ乗ると、
     // 以後の事前姿勢もその誤った場所から出るので「跳んでいない」と見えてしまい、
@@ -442,6 +442,10 @@ private:
         }
       } else if (margin < global_min_margin_) {
         onReject("margin", false, margin);
+        // マージン不足で捨てたときは、サービス 1 回ぶんの要求を消費しない。
+        // 消費すると「曖昧だったので黙って何も返さない」で終わってしまう。
+        // 次のスキャンでやり直す (auto_localize なら元から毎スキャン走る)。
+        if (!auto_localize_) requested_ = true;
         continue;
       }
 
@@ -562,12 +566,12 @@ private:
 
   std::unique_ptr<OrientedFieldLocalizer> localizer_;
   double wfrac_margin_ = 1.05;
-  double global_min_margin_ = 1.0;
+  double global_min_margin_ = 1.05;
   bool auto_localize_ = false;
   bool enable_track_ = true;
   int track_after_accepts_ = 3;
   int max_consecutive_rejects_ = 5;
-  double max_accept_jump_m_ = 2.0;
+  double max_accept_jump_m_ = 0.5;
   double max_accept_yaw_deg_ = 20.0;
   double track_max_wfrac_ = 0.35;
   bool use_odometry_ = true;

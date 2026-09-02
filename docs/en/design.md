@@ -108,6 +108,12 @@ area; TRACK scales with the window only. On the largest map (52 x 50 m) GLOBAL m
 - TRACK accepts or rejects in two stages. (1) The **jump from the prior**
   (`max_accept_jump_m` / `max_accept_yaw_deg`) drops one-off mismatches. (2) **WFRAC**
   (`track_max_wfrac`) drops wrong locks.
+  The threshold for (1) is set well above the per-scan prior error and well below the distance to
+  an ambiguous solution. In a self-similar corridor the ambiguous solution stands 2 m away, so the
+  previous default of 2.0 m let it through. Tightening it, however, **raises the number of TRACK
+  rejections and hence of GLOBAL restarts, each a lottery ticket on an ambiguous solution**, so it
+  must be tightened together with `global_min_margin`
+  ([nav2_closed_loop.md](nav2_closed_loop.md)).
   **Without (2) a broken track cannot be detected.** The prior is built from the previous accepted
   pose, so once the track lands somewhere wrong every later prior comes from that wrong place and no
   solution ever looks like a jump. A wrong lock is self-consistent, so a jump gate cannot catch it in
