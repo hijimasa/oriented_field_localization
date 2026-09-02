@@ -152,6 +152,12 @@ public:
     publish_initialpose_ = declare_parameter("publish_initialpose", true);
     initialpose_repeat_ = declare_parameter("initialpose_repeat", 5);
     initialpose_wait_s_ = declare_parameter("initialpose_wait_s", 60);
+    smooth_base_m_ = declare_parameter("smooth_base_m", 0.0);
+    smooth_gain_ = declare_parameter("smooth_gain", 0.0);
+    smooth_rot_lever_m_ = declare_parameter("smooth_rot_lever_m", 0.3);
+    smooth_bypass_m_ = declare_parameter("smooth_bypass_m", 0.3);
+    smooth_bypass_deg_ = declare_parameter("smooth_bypass_deg", 10.0);
+    smooth_saturate_scans_ = declare_parameter("smooth_saturate_scans", 5);
     map_frame_ = declare_parameter("map_frame", std::string("map"));
     odom_frame_ = declare_parameter("odom_frame", std::string("odom"));
     base_frame_ = declare_parameter("base_frame", std::string("base_link"));
@@ -460,8 +466,10 @@ private:
   {
     bool became_track = false;
     bool first_lock = false;
+    bool have_odom = false;
     {
       std::lock_guard<std::mutex> lk(state_mu_);
+      have_odom = has_odom_;
       first_lock = !has_pose_;
       last_pose_ = {best.x, best.y, best.yaw};
       has_pose_ = true;
@@ -474,7 +482,9 @@ private:
         became_track = true;
       }
     }
-    publishPose(best, odom_now, stamp, /*also_initialpose=*/!was_track && first_lock);
+    // GLOBAL からの採択 (初回ロック・追跡喪失からの復帰) は平滑化せず即座に反映する
+    publishPose(best, odom_now, stamp, /*also_initialpose=*/!was_track && first_lock,
+      /*snap=*/!was_track, have_odom);
     RCLCPP_INFO(get_logger(),
       "%s accept (%.2f, %.2f, %.1f deg) score %.4f margin %.2f wfrac %.3f in %.0f ms "
       "(%zu cands)%s",
@@ -502,16 +512,85 @@ private:
       back_to_global ? " -> GLOBAL" : "");
   }
 
+  /// 出力する姿勢だけを鈍らせる。**内部の事前姿勢 (last_pose_) は生のまま**なので、
+  /// TRACK の引き込みも WFRAC の判定も kidnap の検出も一切変わらない。
+  ///
+  /// 平滑化するのは「前回の出力をオドメトリで伝播した予測」からの**補正量**だけで、
+  /// 実際の運動は素通りする。したがって遅れは補正量の変化率 (= オドメトリの
+  /// ドリフト率) にしか比例しない。
+  ///
+  /// snap = true (GLOBAL からの採択) と、補正が smooth_bypass_* を超えた場合は
+  /// 鈍らせない。kidnap 復帰の 10 m 級の補正を鈍らせると、数秒間まちがった姿勢で
+  /// 航行することになり、跳びより悪い。
+  Pose2D smoothOutput(
+    const Pose2D & raw, const Pose2D & odom_now, bool snap, bool have_odom)
+  {
+    const bool can_predict = has_out_ && use_odometry_ && have_odom && had_out_odom_;
+    const bool smoothing = smooth_base_m_ > 0 || smooth_gain_ > 0;
+    if (!smoothing || snap || !can_predict) {
+      out_pose_ = raw;
+      saturated_ = 0;
+    } else {
+      const Pose2D od = relative(out_odom_, odom_now);   // このスキャンの運動量
+      const Pose2D pred = compose(out_pose_, od);
+      const double dx = raw.x - pred.x, dy = raw.y - pred.y;
+      const double dyaw = wrapPi(raw.yaw - pred.yaw);
+      const double d = std::hypot(dx, dy);
+      const double dyaw_deg = std::fabs(dyaw) * 180.0 / M_PI;
+      if ((smooth_bypass_m_ > 0 && d > smooth_bypass_m_) ||
+        (smooth_bypass_deg_ > 0 && dyaw_deg > smooth_bypass_deg_))
+      {
+        out_pose_ = raw;                       // 大きい補正は即座に反映する
+        saturated_ = 0;
+      } else {
+        // 1 スキャンあたりの補正量に上限を置く (スルーレート制限)。
+        // 一次遅れではなく上限にしてあるのは、オドメトリのドリフトが旋回中に
+        // 集中するので、時定数だと遅れがそこだけ膨らんで読みにくいため。
+        // **補正権限を運動量に比例させる。**オドメトリの誤差は移動量と回転量に
+        // 比例して増える (AMCL の alpha1..alpha4 と同じ形) ので、上限を固定に
+        // すると、止まっているときは緩すぎ、激しく動いているときは足りない。
+        // 実測: オドメトリ誤差の増加は巡航で 0.21 m/s、kidnap 後の切り返しで
+        // 0.60 m/s だった。固定 0.20 m/s では後者に 3 倍足りない。
+        const double dtrans = std::hypot(od.x, od.y);
+        const double drot = std::fabs(od.yaw);
+        const double cap_m =
+          smooth_base_m_ + smooth_gain_ * (dtrans + smooth_rot_lever_m_ * drot);
+        const double cap_deg =
+          (smooth_base_m_ / std::max(smooth_rot_lever_m_, 1e-6) + smooth_gain_ * drot)
+          * 180.0 / M_PI;
+        const bool sat_pos = d > cap_m;
+        const bool sat_yaw = dyaw_deg > cap_deg;
+        if (sat_pos || sat_yaw) saturated_++; else saturated_ = 0;
+        if (smooth_saturate_scans_ > 0 && saturated_ >= smooth_saturate_scans_) {
+          // **上限に張り付いたままなら追随を諦めて飛ばす。**補正の要求が権限を
+          // 上回り続けると、bypass に届かない値 (実測 0.15 m) で遅れが安定して
+          // しまい、大きさだけ見ている bypass では検出できない。
+          out_pose_ = raw;
+          saturated_ = 0;
+        } else {
+          const double ks = sat_pos ? cap_m / d : 1.0;
+          const double kyaw = sat_yaw ? (cap_deg * M_PI / 180.0) / std::fabs(dyaw) : 1.0;
+          out_pose_ = {pred.x + ks * dx, pred.y + ks * dy, wrapPi(pred.yaw + kyaw * dyaw)};
+        }
+      }
+    }
+    out_odom_ = odom_now;
+    has_out_ = true;
+    had_out_odom_ = have_odom;
+    return out_pose_;
+  }
+
   void publishPose(
     const PoseCandidate & c, const Pose2D & odom_now, const rclcpp::Time & stamp,
-    bool also_initialpose)
+    bool also_initialpose, bool snap, bool have_odom)
   {
+    const Pose2D out = smoothOutput({c.x, c.y, c.yaw}, odom_now, snap, have_odom);
     geometry_msgs::msg::PoseWithCovarianceStamped m;
     m.header.stamp = stamp;
     m.header.frame_id = map_frame_;
-    m.pose.pose.position.x = c.x;
-    m.pose.pose.position.y = c.y;
-    m.pose.pose.orientation = yawQuat(c.yaw);
+    m.pose.pose.position.x = out.x;
+    m.pose.pose.position.y = out.y;
+    m.pose.pose.orientation = yawQuat(out.yaw);
     m.pose.covariance[0] = 0.25;
     m.pose.covariance[7] = 0.25;
     m.pose.covariance[35] = 0.07;
@@ -532,7 +611,7 @@ private:
     if (tf_mode_ == TfMode::MapToOdom) {
       // REP-105: 位置推定が出すのは map -> odom。
       //   T_map_base = T_map_odom * T_odom_base  =>  T_map_odom = T_map_base * T_odom_base^-1
-      const Pose2D map_odom = compose({c.x, c.y, c.yaw}, inverse(odom_now));
+      const Pose2D map_odom = compose(out, inverse(odom_now));
       tf.header.frame_id = map_frame_;
       tf.child_frame_id = odom_frame_;
       tf.transform.translation.x = map_odom.x;
@@ -541,9 +620,9 @@ private:
     } else {
       tf.header.frame_id = map_frame_;
       tf.child_frame_id = base_frame_;
-      tf.transform.translation.x = c.x;
-      tf.transform.translation.y = c.y;
-      tf.transform.rotation = yawQuat(c.yaw);
+      tf.transform.translation.x = out.x;
+      tf.transform.translation.y = out.y;
+      tf.transform.rotation = yawQuat(out.yaw);
     }
     tf_broadcaster_->sendTransform(tf);
   }
@@ -578,6 +657,12 @@ private:
   bool publish_initialpose_ = true;
   int initialpose_repeat_ = 5;
   int initialpose_wait_s_ = 60;
+  double smooth_base_m_ = 0.0;          ///< 静止時の補正権限 [m/scan]。0 で無効
+  double smooth_gain_ = 0.0;            ///< 運動量に対する補正権限の比。0 で無効
+  double smooth_rot_lever_m_ = 0.3;     ///< 回転 [rad] を位置誤差 [m] に換算する腕
+  double smooth_bypass_m_ = 0.3;
+  double smooth_bypass_deg_ = 10.0;
+  int smooth_saturate_scans_ = 5;
   double transform_tolerance_ = 0.2;
   TfMode tf_mode_ = TfMode::None;
   std::string map_frame_, odom_frame_, base_frame_;
@@ -594,6 +679,9 @@ private:
   std::mutex state_mu_;               ///< 追跡状態とオドメトリ
   Pose2D last_pose_, odom_, odom_at_accept_;
   bool has_pose_ = false, has_odom_ = false, had_odom_at_accept_ = false;
+  Pose2D out_pose_, out_odom_;          ///< 出力用 (平滑化後)。内部の事前姿勢とは別
+  bool has_out_ = false, had_out_odom_ = false;
+  int saturated_ = 0;                   ///< 補正が上限に張り付いた連続回数
   int consecutive_accepts_ = 0, consecutive_rejects_ = 0;
 
   std::mutex initialpose_mu_;

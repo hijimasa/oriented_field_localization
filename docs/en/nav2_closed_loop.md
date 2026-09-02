@@ -349,6 +349,71 @@ not caught by the margin either** (the open loop still shows a maximum of 18.99 
 179.3 deg). A flipped solution scores highly in its own right, so its ratio to the runner-up
 is wide. Catching that is WFRAC's job, and it does not arise with TRACK enabled.
 
+## Result 5: smoothing only the output (off by default)
+
+Even after the recalibration, the one-step discontinuity remained larger than AMCL's
+(95%: 0.049 against 0.014 m). The difference comes not from estimation accuracy but from
+**how updates are applied**. AMCL does not update its filter until the robot has moved
+`update_min_d = 0.2 m`; in between, map -> odom is constant, so map -> base is pure
+odometry — perfectly smooth. This package applies a correction on every scan (10 Hz).
+
+So a path was added that damps **only the published pose**. The internal prior (the
+starting point of the next TRACK) stays the raw accepted pose, so pull-in, the WFRAC
+test and kidnap detection are all unchanged. What is damped is only the **correction**
+away from "the previous output propagated by odometry"; the real motion passes through
+untouched.
+
+### A rate limit, not a first-order lag
+
+In TRACK, an accepted pose is already within `max_accept_jump_m` of the prior, so the
+one-step correction already has a hard bound. The measurements show that bound at work:
+**the 2.211 m maximum discontinuity at the old default of 2.0 m was the gate value
+itself** (at the new 0.5 m default the maximum is 0.371 m, with no violations). To keep
+that "the bound is guaranteed" property, the smoothing is a slew-rate limit too.
+
+### Three variants measured
+
+| | closed static: median / max / disc. 95% | open base: median / max | open, after kidnap |
+|---|---|---|---:|
+| no smoothing (x3) | 0.0381 / 0.379 / 0.0494 | 0.038 / 0.325 | **0.070** |
+| fixed 0.02 m/scan (x3) | 0.0366 / 0.146 / **0.0200** | 0.047 / 0.468 | 0.150 |
+| + saturation escape | — | — | 0.110 |
+| **proportional to motion** (x2) | 0.0375 / **0.126** / 0.0308 | 0.038 / 0.870 | **0.086** |
+
+**A fixed cap cannot serve both motion regimes.** It works while cruising, but during the
+tight maneuvering in a room after a kidnap the position error doubled (0.070 -> 0.150 m).
+Measurement found the cause: odometry error grows at 0.21 m/s while cruising and at
+**0.60 m/s** during that maneuvering, against a fixed correction authority of
+0.02 m/scan = 0.20 m/s — 3x short. What cannot be absorbed settles as **a steady lag of
+about 0.15 m, below the 0.3 m bypass**, and a bypass that only looks at magnitude cannot
+see that sustained saturation.
+
+Two remedies were added.
+
+1. **Saturation escape** (`smooth_saturate_scans`): once the limiter has clamped for that
+   many scans in a row, give up and snap, bounding the lag in scans. Alone: 0.150 -> 0.110 m
+2. **Correction authority proportional to motion** (`smooth_gain`): odometry error grows
+   with translation and rotation (the same form as AMCL's `alpha1..alpha4`), so the
+   authority should too. In Kalman terms this is process noise scaled with motion, raising
+   the gain at speed. 0.150 -> **0.086 m**, essentially back to no smoothing
+
+### Why the default is off
+
+The proportional variant removes the lag as intended and gives the best closed-loop
+maximum error of the three (0.379 -> 0.126 m). It is still not the default.
+
+- **The only thing it reliably improves is the one-step discontinuity** (95%:
+  0.049 -> 0.031 m). After the recalibration of Result 4 removed the large jumps,
+  **no measurement shows that discontinuity costing anything**
+- It couples the output to odometry quality and adds three parameters of tuning surface
+- The single number that got worse (open-loop maximum, 0.870 m) is unexplained at n=1.
+  That said, t≈75.8 s is a site that turns ambiguous regardless of configuration, and the
+  three runs without smoothing gave 0.325 / 0.460 / 0.420 m there. One run cannot separate
+  the smoothing from run-to-run variation
+
+**It is worth enabling for gentle motion (Nav2 and the like)**: recommended settings are
+`smooth_base_m: 0.005` and `smooth_gain: 0.5`.
+
 ## A defect this validation found and fixed: the `/initialpose` handoff is lost to a startup race
 
 `publish_initialpose` exists so that OFL can fix the first pose, publish it to

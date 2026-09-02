@@ -130,6 +130,8 @@ Set `auto_localize: true` to run on every incoming scan.
 | `use_odometry` | `true` | propagate the prior with `/odom` |
 | `publish_initialpose` | `true` | publish `/initialpose` on the first lock (and on re-acquisition after losing track) |
 | `initialpose_repeat` | `5` | how many times to republish `/initialpose`. **Not spent while there is no subscriber** |
+| `smooth_base_m` | `0.0` | damp **only the published pose** (the internal prior stays raw); 0 disables. `0.005` is recommended for gentle motion |
+| `smooth_gain` | `0.5` | the part of the correction authority that scales with motion; a fixed cap lags during aggressive maneuvering |
 | `tf_mode` | `none` | `none` / `map_to_odom` (REP-105) / `map_to_base` |
 
 Important invariants:

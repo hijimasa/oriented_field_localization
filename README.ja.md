@@ -125,6 +125,8 @@ ros2 service call \
 | `use_odometry` | `true` | `/odom` で事前姿勢を伝播する |
 | `publish_initialpose` | `true` | 初回ロック (と追跡喪失後の再取得) で `/initialpose` を出す |
 | `initialpose_repeat` | `5` | `/initialpose` を出し直す回数。**購読者が居ない間は消費しない** |
+| `smooth_base_m` | `0.0` | **出力する姿勢だけ**を鈍らせる (内部の事前姿勢は生のまま)。0 で無効。穏やかに走る用途では `0.005` を推奨 |
+| `smooth_gain` | `0.5` | 補正権限のうち運動量に比例するぶん。固定上限だと激しい機動で遅れる |
 | `tf_mode` | `none` | `none` / `map_to_odom` (REP-105) / `map_to_base` |
 
 重要な不変条件:
