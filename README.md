@@ -127,6 +127,9 @@ Set `auto_localize: true` to run on every incoming scan.
 | `max_accept_jump_m` | `0.5` | drop a TRACK solution that jumped further than this from the prior `[m]`. **Well above the per-scan prior error, well below the distance to an ambiguous solution** (0.05 m of real motion at 0.5 m/s and 10 Hz) |
 | `max_accept_yaw_deg` | `20.0` | the same in `[deg]`; 0 disables |
 | `track_max_wfrac` | `0.35` | reject in TRACK when the fraction of points off the walls exceeds this. **This is what detects a wrong lock.** Use `0.45`--`0.50` where unmapped obstacles are expected |
+| `update_min_d` | `0.2` | do not re-search in TRACK until the robot has moved this far `[m]`; 0 searches every scan. **The WFRAC check is never gated**, so wrong-lock detection stays per-scan |
+| `update_min_a_deg` | `15.0` | the same in `[deg]` |
+| `update_max_interval_s` | `1.0` | search at least this often even when stationary `[s]` |
 | `use_odometry` | `true` | propagate the prior with `/odom` |
 | `publish_initialpose` | `true` | publish `/initialpose` on the first lock (and on re-acquisition after losing track) |
 | `initialpose_repeat` | `5` | how many times to republish `/initialpose`. **Not spent while there is no subscriber** |

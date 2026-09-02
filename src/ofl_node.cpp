@@ -152,6 +152,9 @@ public:
     publish_initialpose_ = declare_parameter("publish_initialpose", true);
     initialpose_repeat_ = declare_parameter("initialpose_repeat", 5);
     initialpose_wait_s_ = declare_parameter("initialpose_wait_s", 60);
+    update_min_d_ = declare_parameter("update_min_d", 0.2);
+    update_min_a_deg_ = declare_parameter("update_min_a_deg", 15.0);
+    update_max_interval_s_ = declare_parameter("update_max_interval_s", 1.0);
     smooth_base_m_ = declare_parameter("smooth_base_m", 0.0);
     smooth_gain_ = declare_parameter("smooth_gain", 0.0);
     smooth_rot_lever_m_ = declare_parameter("smooth_rot_lever_m", 0.3);
@@ -401,6 +404,38 @@ private:
       }
       const bool use_track = enable_track_ && tracking_ && have_prior;
 
+      // ---- 探索を動いた分だけに間引く (検証は毎スキャン走らせる) ----
+      // 高いのは相関探索 (実測 29.9 ms/scan) のほうで、WFRAC はビーム数ぶんの
+      // 地図参照だけなので桁が違う。**距離でゲートするのは探索だけにする。**
+      // 検証まで間引くと、kidnap 後に停止している間は誤ロックを検出できなくなる。
+      if (use_track && update_min_d_ > 0) {
+        const Pose2D moved = relative(pose_at_search_, prior);
+        const double since = (now() - last_search_).seconds();
+        const bool moved_enough =
+          std::hypot(moved.x, moved.y) >= update_min_d_ ||
+          std::fabs(moved.yaw) * 180.0 / M_PI >= update_min_a_deg_;
+        const bool timed_out =
+          update_max_interval_s_ > 0 && since >= update_max_interval_s_;
+        if (!moved_enough && !timed_out) {
+          PoseCandidate pc;
+          pc.x = prior.x; pc.y = prior.y; pc.yaw = prior.yaw;
+          const double w = localizer_->wallMissFraction(pc, beams);
+          if (!(track_max_wfrac_ > 0 && w > track_max_wfrac_)) {
+            // 事前姿勢は地図と整合している。探索せず、そのまま出す。
+            // map -> odom は前回の採択から変わらない (AMCL と同じ挙動)。
+            skipped_++;
+            PoseCandidate out;
+            out.x = prior.x; out.y = prior.y; out.yaw = prior.yaw; out.score = 0;
+            publishPose(out, odom_now, scan->header.stamp,
+              /*also_initialpose=*/false, /*snap=*/false, /*have_odom=*/true);
+            continue;
+          }
+          // WFRAC が閾値を超えた: 動いていなくても探索する
+        }
+        pose_at_search_ = prior;
+        last_search_ = now();
+      }
+
       const auto t0 = std::chrono::steady_clock::now();
       std::vector<PoseCandidate> cands;
       if (use_track) {
@@ -487,9 +522,10 @@ private:
       /*snap=*/!was_track, have_odom);
     RCLCPP_INFO(get_logger(),
       "%s accept (%.2f, %.2f, %.1f deg) score %.4f margin %.2f wfrac %.3f in %.0f ms "
-      "(%zu cands)%s",
+      "(%zu cands, skip %d)%s",
       was_track ? "TRACK" : "GLOBAL", best.x, best.y, best.yaw * 180.0 / M_PI,
-      best.score, margin, wfrac, 1e3 * dt, n_cands, became_track ? " -> TRACK" : "");
+      best.score, margin, wfrac, 1e3 * dt, n_cands, skipped_.load(),
+      became_track ? " -> TRACK" : "");
   }
 
   void onReject(const char * why, bool was_track, double a = 0, double b = 0)
@@ -657,6 +693,9 @@ private:
   bool publish_initialpose_ = true;
   int initialpose_repeat_ = 5;
   int initialpose_wait_s_ = 60;
+  double update_min_d_ = 0.2;           ///< これだけ動くまで探索しない [m]。0 で無効
+  double update_min_a_deg_ = 15.0;      ///< 同 [deg]
+  double update_max_interval_s_ = 1.0;  ///< 停止していても この間隔では探索する [s]
   double smooth_base_m_ = 0.0;          ///< 静止時の補正権限 [m/scan]。0 で無効
   double smooth_gain_ = 0.0;            ///< 運動量に対する補正権限の比。0 で無効
   double smooth_rot_lever_m_ = 0.3;     ///< 回転 [rad] を位置誤差 [m] に換算する腕
@@ -682,6 +721,9 @@ private:
   Pose2D out_pose_, out_odom_;          ///< 出力用 (平滑化後)。内部の事前姿勢とは別
   bool has_out_ = false, had_out_odom_ = false;
   int saturated_ = 0;                   ///< 補正が上限に張り付いた連続回数
+  Pose2D pose_at_search_;               ///< 最後に探索したときの事前姿勢
+  rclcpp::Time last_search_{0, 0, RCL_ROS_TIME};
+  std::atomic<int> skipped_{0};         ///< 探索を省いたスキャン数
   int consecutive_accepts_ = 0, consecutive_rejects_ = 0;
 
   std::mutex initialpose_mu_;

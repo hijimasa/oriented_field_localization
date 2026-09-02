@@ -414,6 +414,95 @@ maximum error of the three (0.379 -> 0.126 m). It is still not the default.
 **It is worth enabling for gentle motion (Nav2 and the like)**: recommended settings are
 `smooth_base_m: 0.005` and `smooth_gain: 0.5`.
 
+## Result 6: compute — from 38x AMCL to 3.7x
+
+Latency (10 ms per scan) is in the log, but **what decides whether things can run side by
+side is CPU time**, so that was measured separately (`CPU_LOG=1` samples utime+stime from
+`/proc/PID/stat` every 2 s).
+
+### Running in parallel works
+
+`LOC=amcl_ofl` runs ofl_node and AMCL together for 300 s. CPU is essentially the same as
+running each alone (AMCL 6.5 -> 7.7 s, OFL 245.7 -> 251.1 s) and the real-time factor
+stays at 1.00x: **they do not interfere**. The only thing they contend for is the
+`map -> odom` transform, which is settled by `tf_mode: none` (OFL) or
+`tf_broadcast: false` (AMCL).
+
+### The naive implementation was 38x AMCL
+
+| Condition | CPU s / 300 s | cores | searches | median latency |
+|---|---:|---:|---:|---:|
+| OFL, 6 threads (then default) | 245.7 | 0.78 | 3151 | 10 ms |
+| OFL, 1 thread | 94.5 | 0.30 | 3157 | 29 ms |
+| **AMCL** | **6.5** | **0.02** | ~700 (estimated) | — |
+
+One thread: 94.5 s / 3157 scans = 29.9 ms, matching the logged 29 ms latency. Six threads
+cut latency by 2.9x but raise CPU by 2.6x — **OpenMP spin-waiting**.
+
+**AMCL is not cheap because its per-hypothesis cost is unusual.** One update (about 8 ms)
+scores 500-2000 particles x `max_beams` 120 = 60k-240k beams, i.e. 30-130 ns per
+beam-particle, which is an ordinary figure for one lookup into a precomputed likelihood
+field. The difference is **how many hypotheses are evaluated**. AMCL scores the particles
+odometry already placed; it never re-searches for the pose. OFL's TRACK sweeps a
+3 m / 30 deg window every time, and that is what buys the pull-in and the wrong-lock
+detection.
+
+### What actually helped
+
+| Measure | CPU | why |
+|---|---:|---|
+| **Gate the search on distance** (`update_min_d`) | **4.2x** | searches 3151 -> 702; the WFRAC check still runs every scan |
+| `OMP_WAIT_POLICY=passive` + 2 threads | 2.0x | removes the spin-wait; free |
+| Narrow the window (`track_search_m` 3.0 -> 1.5) | 1.2x | **much less than expected** (below) |
+
+| Condition | CPU s | cores | searches | latency | median error | disc. 95% |
+|---|---:|---:|---:|---:|---:|---:|
+| default, 6t | 245.7 | 0.78 | 3151 | 10 ms | 0.0400 | 0.0499 |
+| distance gate | 58.5 | 0.19 | 702 | 11 ms | 0.0364 | **0.0215** |
+| **tuned** (win 1.5 + gate + 2t + passive) | **24.3** | **0.08** | 694 | 18 ms | 0.0385 | 0.0280 |
+| AMCL | 6.5 | 0.02 | — | — | — | — |
+
+**The distance gate halves the discontinuity without costing accuracy** (0.050 ->
+0.022 m). Between updates `map -> odom` is fixed and map -> base is pure odometry — the
+same mechanism that makes AMCL smooth. **It delivers what the output smoothing of
+Result 5 delivered, at a quarter of the CPU and with no side effect.** Kidnap recovery
+stayed at 0.8 s, in the tuned configuration too.
+
+**Only the search is gated; the WFRAC check runs on every scan.** Gating the check as
+well would make a wrong lock undetectable while the robot stands still after a kidnap,
+importing AMCL's weakness. `update_max_interval_s` is the backstop for a wrong lock that
+stands still and still looks healthy to WFRAC.
+
+**The price shows up under aggressive motion.** Between updates the pose is odometry
+propagation, so error remains wherever odometry error grows fast. Under Nav2 there is no
+degradation even after a kidnap (0.037 -> 0.039 m), but in the ground-truth-following open
+loop, maneuvering at full speed inside a room, it goes **0.070 -> 0.150 m**. There the
+rate at which odometry error grows is 0.60 m/s against 0.18 m/s while cruising, and the
+0.2 -- 0.3 s between updates lands directly on the error. Set `update_min_d: 0.0` on a
+platform with poor odometry or for sustained aggressive maneuvering.
+
+### Narrowing the window is not worth it
+
+`localSweep` sweeps `(2·SR+1)² x angles` at the coarsest level (0.20 m/px), so the number
+of positions falls with the square of `track_search_m` (3.0 m: 961 -> 1.5 m: 289 ->
+1.0 m: 121). CPU fell only to 0.81x / 0.65x. **The fine refinement is the floor**: latency
+goes 10 -> 8 -> 6 ms, so roughly 6 ms is fixed cost independent of the window, and the
+coarse sweep is already only 40% of the total. The 1.5 m run also lost pull-in range: a
+transient 0.481 m error stalled it and goals dropped to 10 (others 14-17).
+
+### The remaining 3.7x
+
+The gate only matches AMCL's update **rate**, so what is left is the per-update
+difference (OFL 29.9 ms against AMCL's ~8 ms = 3.7x). That is the price of the search
+width itself, and what it buys is 0.2 -- 0.6 s wrong under dynamic obstacles (AMCL:
+22 -- 106 s) and 0.8 s kidnap recovery (AMCL: never).
+
+**0.08 cores — 2% of a 4-core machine — is enough to run it beside AMCL.**
+
+> Recommended: set `OMP_WAIT_POLICY=passive` and `OMP_NUM_THREADS=2` in the environment.
+> Removing the spin-wait is free, and two threads is the most efficient point (1.38x
+> faster than one thread for 1.31x the CPU; six threads is 2.6x faster for 1.57x).
+
 ## A defect this validation found and fixed: the `/initialpose` handoff is lost to a startup race
 
 `publish_initialpose` exists so that OFL can fix the first pose, publish it to

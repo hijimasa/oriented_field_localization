@@ -30,19 +30,30 @@ The environment and how to run it are in [sim/README.md](../../sim/README.md).
 
 ## Results
 
-At the current defaults (`max_accept_jump_m: 0.5`, `global_min_margin: 1.05`). The
-baseline scenario was repeated three times and is given as a range.
+At the current defaults. The baseline scenario was repeated three times and is given as
+a range.
 
 | Scenario | median | 95% | max | within 0.5 m | yaw median / max |
 |---|---:|---:|---:|---:|---:|
-| **Baseline (GLOBAL -> TRACK)**, x3 | **0.038 -- 0.058 m** | 0.072 -- 0.108 | **0.33 -- 0.46 m** | **100%** x3 | 0.4 / 36 deg |
-| No TRACK (GLOBAL every scan) | 0.059 m | 0.108 m | **18.99 m** | 99.2% | 0.50 / **179.3** deg |
-| Kidnap, before (to 120 s) | 0.056 m | 0.109 m | 0.42 m | **100%** | 0.50 / 36.3 deg |
-| Kidnap, after (120-240 s) | 0.070 m | 0.071 m | 11.26 m | 99.5% | 0.00 / 94.1 deg |
-| *reference: odometry alone* | *5.9 m* | — | *12.3 m* | — | — |
+| **Baseline (GLOBAL -> TRACK)**, x3 | **0.037 -- 0.038 m** | 0.075 -- 0.077 | **0.19 -- 0.48 m** | **100%** x3 | 0.4 / 29 deg |
+| No TRACK (GLOBAL every scan) | 0.066 m | 0.118 m | **19.03 m** | 99.1% | 0.51 / **179.3** deg |
+| Kidnap, before (to 120 s) | 0.042 m | 0.084 m | 0.46 m | **100%** | 0.38 / 28.9 deg |
+| Kidnap, after (120-240 s) | 0.150 m | 0.210 m | 11.27 m | 99.5% | 4.28 / 92.8 deg |
+| *reference: odometry alone* | *5.7 m* | — | *12.5 m* | — | — |
 
-121.5 -- 121.7 m driven; 9 ms of compute per scan (about 10% duty against the 10 Hz
-sensor), 23 ms with TRACK disabled. Recovery from the kidnap takes 0.7 s.
+121.5 -- 121.7 m driven. Recovery from the kidnap takes 0.7 s.
+
+**The search is gated by `update_min_d`**: 590 searches over 240 s, with 1756 scans
+skipped. One search costs 10 ms (25 ms per scan with TRACK disabled).
+
+> **The 0.150 m after the kidnap is the price of gating the search** (0.070 m without
+> it). In that segment the robot maneuvers at full speed inside a room, and the rate at
+> which odometry error grows jumps from 0.18 m/s while cruising to **0.60 m/s**; the
+> 0.2 -- 0.3 s between updates shows up directly as error. **Under Nav2 in the closed
+> loop the same condition shows no degradation** (0.037 -> 0.039 m; see Result 6 in
+> [nav2_closed_loop.md](nav2_closed_loop.md)). On a platform with poor odometry, or for
+> sustained aggressive maneuvering, set `update_min_d: 0.0` to search every scan (4.2x
+> the CPU).
 
 **The localizer holds 0.04-0.06 m while odometry alone drifts to 5.9 m.**
 

@@ -122,6 +122,9 @@ ros2 service call \
 | `max_accept_jump_m` | `0.5` | TRACK で事前姿勢からこれ以上跳んだ解は捨てる `[m]`。**1 スキャンの事前誤差より十分大きく、曖昧解までの距離より小さく**取る (0.5 m/s・10 Hz なら実移動 0.05 m) |
 | `max_accept_yaw_deg` | `20.0` | 同上 `[deg]`。0 で無効 |
 | `track_max_wfrac` | `0.35` | TRACK 中に壁へ載らない点の割合がこれを超えたら棄却。**誤ロックの検出はこれが担う**。地図に無い障害物がある環境では `0.45`--`0.50` |
+| `update_min_d` | `0.2` | これだけ動くまで TRACK の探索をしない `[m]`。0 で毎スキャン。**検証 (WFRAC) は間引かない**ので誤ロック検出は毎スキャンのまま |
+| `update_min_a_deg` | `15.0` | 同 `[deg]` |
+| `update_max_interval_s` | `1.0` | 停止していても この間隔では探索する `[s]` |
 | `use_odometry` | `true` | `/odom` で事前姿勢を伝播する |
 | `publish_initialpose` | `true` | 初回ロック (と追跡喪失後の再取得) で `/initialpose` を出す |
 | `initialpose_repeat` | `5` | `/initialpose` を出し直す回数。**購読者が居ない間は消費しない** |

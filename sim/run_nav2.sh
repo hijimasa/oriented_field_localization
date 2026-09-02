@@ -16,6 +16,7 @@
 #   OFL_ARGS   ofl_node への追加パラメータ
 #   OMP_NUM_THREADS  位置推定の相関に使うスレッド数 (既定 6)
 #   RETRIES    Nav2 の起動に失敗したときの再試行回数 (既定 2)
+#   CPU_LOG    1 で位置推定ノードの CPU 時間を 2 秒ごとに /out/cpu.log へ記録する
 set -eo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,7 +39,8 @@ docker run --rm --network none \
     -e "DURATION=${DURATION}" -e "KIDNAP_AT=${KIDNAP_AT:-}" \
     -e "LOC=${LOC}" -e "DYNAMIC=${DYNAMIC:-0}" \
     -e "OFL_ARGS=${OFL_ARGS:-}" -e "OMP_NUM_THREADS=${OMP_NUM_THREADS:-6}" \
-    -e "DUMP_COSTMAP=${DUMP_COSTMAP:-0}" \
+    -e "DUMP_COSTMAP=${DUMP_COSTMAP:-0}" -e "CPU_LOG=${CPU_LOG:-0}" \
+    -e "OMP_WAIT_POLICY=${OMP_WAIT_POLICY:-}" \
     --entrypoint /bin/bash "${IMAGE}" -lc '
 set -eo pipefail
 source /opt/ros/humble/setup.bash
@@ -100,6 +102,22 @@ case "${LOC}" in
     ;;
   *) echo "unknown LOC=${LOC}" >&2; exit 2;;
 esac
+
+# ---- 位置推定の CPU 時間 (任意) ----
+# 遅延 (1 スキャン何 ms) はログに出るが、**並列に動かせるか**を決めるのは
+# CPU 時間のほうなので別に測る。/proc/PID/stat の utime+stime (10 ms 刻み)。
+if [ "${CPU_LOG:-0}" = "1" ]; then
+  ( while : ; do
+      for pat in ofl_node amcl; do
+        for pid in $(pgrep -x "${pat}" 2>/dev/null); do
+          if read -r _ _ _ _ _ _ _ _ _ _ _ _ _ ut st _ < "/proc/${pid}/stat" 2>/dev/null; then
+            echo "$(date +%s) ${pat} ${pid} ${ut} ${st}"
+          fi
+        done
+      done
+      sleep 2
+    done > /out/cpu.log 2>/dev/null ) &
+fi
 
 # ---- Nav2 ----
 ros2 run nav2_map_server map_server --ros-args --params-file "${PARAMS}" \
