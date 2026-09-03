@@ -31,6 +31,7 @@
 // 構成のために tf_mode: map_to_base も用意してある。
 #include "oriented_field_localization/oriented_field_matcher.hpp"
 #include "oriented_field_localization/reseed_policy.hpp"
+#include "oriented_field_localization/seed_handoff.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
@@ -61,6 +62,8 @@ using oriented_field_localization::ReseedEvidence;
 using oriented_field_localization::ReseedPolicy;
 using oriented_field_localization::ReseedPolicyParams;
 using oriented_field_localization::reseedPosesDisagree;
+using oriented_field_localization::SeedHandoff;
+using oriented_field_localization::SeedHandoffParams;
 
 namespace
 {
@@ -164,6 +167,15 @@ public:
     publish_initialpose_ = declare_parameter("publish_initialpose", true);
     initialpose_repeat_ = declare_parameter("initialpose_repeat", 5);
     initialpose_wait_s_ = declare_parameter("initialpose_wait_s", 60);
+    // 受領確認のしきい値。AMCL は initialpose を受けると次の更新でシード近傍の
+    // 姿勢を出すので、そこまで来たら残りの再送は撒き直しの増幅にしかならない。
+    // 既定は supervise_min_disagreement_* と同じ「同じ場所」判定である。
+    SeedHandoffParams hp;
+    hp.repeat = initialpose_repeat_;
+    hp.wait_s = initialpose_wait_s_;
+    hp.ack_m = declare_parameter("initialpose_ack_m", hp.ack_m);
+    hp.ack_deg = declare_parameter("initialpose_ack_deg", hp.ack_deg);
+    handoff_ = SeedHandoff(hp);
     // AMCL はこの分散でパーティクルを撒き直す。既定は「この格子で解いた解の
     // 不確かさ」に相当する控えめな値で、絞りすぎると誤差を吸収できなくなる。
     initialpose_cov_xy_ = declare_parameter("initialpose_cov_xy", 0.25);
@@ -274,21 +286,30 @@ public:
       // activate がこちらの初回ロックより後になった場合に黙って失われる。
       // **回数で待つのでは足りない** (実測で AMCL の activate は初回ロックの
       // 6 秒後だった)。購読者が現れるまでは回数を消費せずに待ち、現れてから
-      // 出し直す。待ちは initialpose_wait_s_ 秒で打ち切る。
+      // 出し直す。予算の管理と受領による打ち切りは seed_handoff.hpp。
       initialpose_timer_ = create_wall_timer(
         std::chrono::seconds(1), [this] {
+          Pose2D odom_now;
+          bool have_odom = false;
+          {
+            std::lock_guard<std::mutex> lk(state_mu_);
+            odom_now = odom_;
+            have_odom = has_odom_;
+          }
           geometry_msgs::msg::PoseWithCovarianceStamped m;
           {
             std::lock_guard<std::mutex> lk(initialpose_mu_);
-            if (initialpose_left_ <= 0) return;
-            if (initialpose_pub_->get_subscription_count() == 0) {
-              if (++initialpose_waited_ > initialpose_wait_s_) initialpose_left_ = 0;
-              return;
+            const bool has_sub = initialpose_pub_->get_subscription_count() > 0;
+            if (!handoff_.wantRepeat(has_sub, now().seconds())) return;
+            // 再送は生のシードではなく、シード時点からのオドメトリ差分で今の
+            // 姿勢へ運ぶ。撒き直しの間も走行は続いているので、そのまま出すと
+            // 動いた分だけ古い場所へ撒いてしまう。
+            Pose2D seed = seed_pose_;
+            if (use_odometry_ && have_odom && had_odom_at_seed_) {
+              seed = compose(seed_pose_, relative(odom_at_seed_, odom_now));
             }
-            initialpose_left_--;
-            m = initialpose_msg_;
+            m = makePoseMsg(seed, now());
           }
-          m.header.stamp = now();
           initialpose_pub_->publish(m);
         });
     }
@@ -377,14 +398,36 @@ private:
 
   void onAmclPose(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
   {
-    std::lock_guard<std::mutex> lk(state_mu_);
-    amcl_pose_ = {msg->pose.pose.position.x, msg->pose.pose.position.y,
+    const Pose2D amcl{msg->pose.pose.position.x, msg->pose.pose.position.y,
       yawOf(msg->pose.pose.orientation)};
-    // 受け取った時点のオドメトリを一緒に控える。AMCL の publish はこちらの
-    // スキャンと非同期なので、比べるときはこの差分で今の時刻まで運ぶ。
-    odom_at_amcl_ = odom_;
-    had_odom_at_amcl_ = has_odom_;
-    has_amcl_ = true;
+    Pose2D odom_now;
+    bool have_odom = false;
+    {
+      std::lock_guard<std::mutex> lk(state_mu_);
+      amcl_pose_ = amcl;
+      // 受け取った時点のオドメトリを一緒に控える。AMCL の publish はこちらの
+      // スキャンと非同期なので、比べるときはこの差分で今の時刻まで運ぶ。
+      odom_at_amcl_ = odom_;
+      had_odom_at_amcl_ = has_odom_;
+      has_amcl_ = true;
+      odom_now = odom_;
+      have_odom = has_odom_;
+    }
+    // シードの受領確認。AMCL がシード近傍の姿勢を出してきたら、残りの再送は
+    // 撒き直しの増幅にしかならないので止める (docs/amcl_supervision.md の限界に
+    // 挙がっていた「1 回の追跡喪失が repeat 回に増幅される」の対策)。
+    std::lock_guard<std::mutex> lk(initialpose_mu_);
+    if (!handoff_.pending()) return;
+    Pose2D seed = seed_pose_;
+    if (use_odometry_ && have_odom && had_odom_at_seed_) {
+      seed = compose(seed_pose_, relative(odom_at_seed_, odom_now));
+    }
+    const double dm = std::hypot(amcl.x - seed.x, amcl.y - seed.y);
+    const double dd = std::fabs(wrapPi(amcl.yaw - seed.yaw)) * 180.0 / M_PI;
+    if (handoff_.observe(dm, dd)) {
+      RCLCPP_INFO(get_logger(),
+        "amcl acknowledged the seed (%.2f m, %.1f deg apart); stopping repeats", dm, dd);
+    }
   }
 
   void onScan(const sensor_msgs::msg::LaserScan::SharedPtr msg)
@@ -619,7 +662,7 @@ private:
     RCLCPP_WARN(get_logger(),
       "amcl looks lost (wfrac %.3f vs self %.3f, apart %.2f m, %.1f deg); reseeding",
       e.wfrac_other, e.wfrac_self, e.disagree_m, e.disagree_deg);
-    publishInitialPose(makePoseMsg({mine.x, mine.y, mine.yaw}, now()));
+    publishInitialPose({mine.x, mine.y, mine.yaw}, now());
   }
 
   void onAccept(
@@ -764,14 +807,24 @@ private:
   }
 
   /// /initialpose を出し、購読者が現れるまで出し直す準備をする。
-  void publishInitialPose(const geometry_msgs::msg::PoseWithCovarianceStamped & m)
+  /// 再送のためにシード姿勢とその時点のオドメトリを控える (受領確認と
+  /// オドメトリ伝播に使う)。
+  void publishInitialPose(const Pose2D & seed, const rclcpp::Time & stamp)
   {
     if (!publish_initialpose_) return;
-    initialpose_pub_->publish(m);
+    initialpose_pub_->publish(makePoseMsg(seed, stamp));
+    Pose2D odom_now;
+    bool have_odom = false;
+    {
+      std::lock_guard<std::mutex> lk(state_mu_);
+      odom_now = odom_;
+      have_odom = has_odom_;
+    }
     std::lock_guard<std::mutex> lk(initialpose_mu_);
-    initialpose_msg_ = m;
-    initialpose_left_ = initialpose_repeat_ - 1;
-    initialpose_waited_ = 0;
+    seed_pose_ = seed;
+    odom_at_seed_ = odom_now;
+    had_odom_at_seed_ = have_odom;
+    handoff_.start(now().seconds());
   }
 
   void publishPose(
@@ -782,7 +835,7 @@ private:
     const auto m = makePoseMsg(out, stamp);
     pose_pub_->publish(m);
     if (also_initialpose) {
-      publishInitialPose(m);
+      publishInitialPose(out, stamp);
       // 引き継ぎも再シードも同じ最小間隔で数える (連続して撒き直さない)
       reseed_.noteFired(now().seconds());
     }
@@ -885,9 +938,9 @@ private:
   bool had_odom_at_amcl_ = false;
 
   std::mutex initialpose_mu_;
-  geometry_msgs::msg::PoseWithCovarianceStamped initialpose_msg_;
-  int initialpose_left_ = 0;
-  int initialpose_waited_ = 0;
+  SeedHandoff handoff_;                 ///< 再送予算と受領確認 (seed_handoff.hpp)
+  Pose2D seed_pose_, odom_at_seed_;     ///< 最後のシードと、その時点のオドメトリ
+  bool had_odom_at_seed_ = false;
   rclcpp::TimerBase::SharedPtr initialpose_timer_;
 
   std::thread worker_;

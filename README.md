@@ -133,7 +133,9 @@ Set `auto_localize: true` to run on every incoming scan.
 | `update_max_interval_s` | `1.0` | search at least this often even when stationary `[s]` |
 | `use_odometry` | `true` | propagate the prior with `/odom` |
 | `publish_initialpose` | `true` | publish `/initialpose` on the first lock (and on re-acquisition after losing track) |
-| `initialpose_repeat` | `5` | how many times to republish `/initialpose`. **Not spent while there is no subscriber** |
+| `initialpose_repeat` | `5` | how many times to republish `/initialpose`. **Not spent while there is no subscriber**. Repeats carry the seed forward by odometry before publishing |
+| `initialpose_ack_m` | `0.5` | receipt acknowledgement: once a post-seed `amcl_pose` lands within this of the seed, **the remaining repeats are dropped** (one reseed decision must not amplify into `repeat` scatters). Active only with `supervise_amcl` |
+| `initialpose_ack_deg` | `20.0` | the same in `[deg]`; 0 ignores the angle |
 | `smooth_base_m` | `0.0` | damp **only the published pose** (the internal prior stays raw); 0 disables. `0.005` is recommended for gentle motion |
 | `smooth_gain` | `0.5` | the part of the correction authority that scales with motion; a fixed cap lags during aggressive maneuvering |
 | `tf_mode` | `none` | `none` / `map_to_odom` (REP-105) / `map_to_base` |
@@ -168,12 +170,14 @@ colcon test --packages-select oriented_field_localization
 colcon test-result --verbose
 ```
 
-There are two ROS-independent unit tests. `test_matcher` (20 checks) covers the parameter
+There are three ROS-independent unit tests. `test_matcher` (20 checks) covers the parameter
 invariants, recovery of known poses, the candidate pool's properties (score ordering, NMS
 separation, size cap), the sign of WFRAC, and TRACK's pull-in and window boundary.
 `test_reseed_policy` (21 checks) covers the AMCL supervision rule — that dynamic obstacles
 do not trigger it, that a pose AMCL already agrees with is never reseeded, and the
-consecutive-hit count and minimum interval.
+consecutive-hit count and minimum interval. `test_seed_handoff` (22 checks) covers the
+`/initialpose` repeat budget — that it is not spent while there is no subscriber, and that
+an acknowledged seed stops the remaining repeats.
 
 ## Continuous-drive validation in Gazebo
 
@@ -263,13 +267,17 @@ map push the healthy WFRAC itself close to 0.50. Comparing against **our own WFR
 on the same scan** cancels that, since the obstacles land on both poses equally. The rule
 lives in
 [reseed_policy.hpp](include/oriented_field_localization/reseed_policy.hpp), is independent of
-ROS, and has 21 unit tests.
+ROS, and has 21 unit tests. The thresholds are backed by a synthetic calibration over the
+15 disturbance conditions, 1,800 samples per class (0/1800 false fires; 99.5% per-scan
+detection in the mis-lock band; `eval/run_reseed_margin.sh`, docs/en/amcl_supervision.md).
 
 **Reseeding is not free.** `/initialpose` scatters the particle cloud, which is itself a pose
 jump, and because the local costmap lives in the odom frame the path is invalidated and
 `follow_path` aborts. The decision is therefore damped by a consecutive-hit count and a
 minimum interval, and **no reseed happens — including the startup handoff — while AMCL points
-at the same place we do**.
+at the same place we do**. The repeats themselves are also cut off as soon as AMCL publishes
+a pose near the seed ([seed_handoff.hpp](include/oriented_field_localization/seed_handoff.hpp) —
+one reseed decision must not amplify into `initialpose_repeat` scatters).
 
 ## Relationship to the sibling package
 
@@ -289,7 +297,8 @@ focuses on the GLOBAL and TRACK searches themselves.
 oriented_field_localization/
 ├── include/oriented_field_localization/
 │   ├── oriented_field_matcher.hpp
-│   └── reseed_policy.hpp            # AMCL supervision rule (ROS-independent)
+│   ├── reseed_policy.hpp            # AMCL supervision rule (ROS-independent)
+│   └── seed_handoff.hpp             # /initialpose repeat budget + receipt ack (ROS-independent)
 ├── src/
 │   ├── oriented_field_matcher.cpp   # ROS-independent matching library
 │   └── ofl_node.cpp                 # ROS 2 node
@@ -299,7 +308,8 @@ oriented_field_localization/
 ├── config/params.yaml
 ├── tests/
 │   ├── test_matcher.cpp
-│   └── test_reseed_policy.cpp
+│   ├── test_reseed_policy.cpp
+│   └── test_seed_handoff.cpp
 ├── sim/                             # continuous-drive validation in Gazebo
 │                                     #   (open loop: run_sim.sh, closed loop: run_nav2.sh)
 │   ├── make_env.py                  # world, map and route from one wall definition
@@ -313,7 +323,10 @@ oriented_field_localization/
 │   ├── bbs_eval.cpp                 # BBS baseline
 │   ├── make_synthetic_map.py
 │   ├── summarize.py
-│   └── run_compare.sh
+│   ├── run_compare.sh
+│   ├── reseed_margin_eval.cpp       # synthetic calibration of the supervision thresholds
+│   ├── summarize_reseed.py
+│   └── run_reseed_margin.sh
 ├── docker/                          # minimal ROS 2 environment for build and test
 └── docs/
     ├── design.md                    # design and known limits

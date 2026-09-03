@@ -83,6 +83,64 @@ absolute threshold calibrated on a static world (0.35) misfires. Comparing again
 on both poses equally. The observed separation was 0.000 healthy against 0.620
 mis-locked — a gap of 0.62.
 
+## Statistical calibration of the thresholds (synthetic, added later)
+
+Measured 2026-09-03
+
+The closed loop produced a single supervisor firing, so the thresholds were not
+statistically calibrated. Observing a broken AMCL in closed loop at scale is
+expensive, so instead the failure modes were **synthesised as pose displacements**
+on top of the [eval/](../../eval/) scan dump (15 disturbance conditions x 40 poses),
+and the full per-scan rule (geometry: absolute WFRAC and excess; disagreement:
+0.5 m or 20 deg) was scored per class (`eval/run_reseed_margin.sh`, 1,800 samples
+per class):
+
+| Class | Displacement | Fire rate |
+|---|---|---:|
+| healthy AMCL | <= 0.15 m / <= 5 deg | **0.0% (0/1800)** |
+| drifted | 0.15–1.5 m / <= 20 deg | 72.5% |
+| mis-lock | 1–3 m, any yaw | **99.5%** |
+| kidnap | >= 3 m, any yaw | **99.7%** |
+
+What it shows:
+
+- **Zero false fires across all 15 disturbance conditions**, including 25 unmapped
+  obstacles (phantom25) and half the field of view occluded (sector180). The
+  excess-over-own-baseline term cancels the disturbances as designed.
+- **The firing boundary is set by the disagreement gate, not by the WFRAC
+  thresholds.** The fire rate steps from ~0% to 97% at 0.5 m; the geometry stage is
+  already 94% positive by 0.3–0.4 m. Sweeping `supervise_max_wfrac` /
+  `supervise_wfrac_excess` over the whole 0.25–0.50 / 0.05–0.30 grid leaves healthy
+  at 0% and detection at >= 97% everywhere. **The defaults (0.35 / 0.15) are not
+  sitting on a cliff.**
+- The band containing the one real event (1.55 m / 94 deg) detects at 99.5% per
+  scan; the misses concentrate in sector180 (93.3%).
+- This measures the per-scan test. The deployed rule adds the 10-consecutive-scan
+  count and the minimum interval on top, which push false fires further down and add
+  about one second of detection latency.
+
+## Closed-loop re-measurement with the receipt acknowledgement (added later)
+
+Measured 2026-09-03
+
+With the repeat amplification cut off by the receipt acknowledgement (see Limits),
+one supervised kidnap run and one supervised static run were re-taken:
+
+| Condition | Median error | Time > 0.5 m | Goals | AMCL scatters |
+|---|---:|---:|---:|---:|
+| kidnap, supervised + ack | 0.051 / 0.056 m (pre/post) | **0.80 s** | 14/15 | **3** (was 14 / 9) |
+| static, supervised + ack | 0.056 m | 0.0 s | 16/17 | **1** (was 4) |
+
+- The startup handoff was acknowledged 0.1 s after the first publish — AMCL came
+  back with a pose next to the seed — and the remaining four repeats were dropped
+  (static scatters 4 -> 1).
+- In the kidnap run the recovery `/initialpose` was cut off the same way; 3 scatters
+  in 300 s against 14 / 9 with the old implementation. Time wrong shrank from
+  7.8 / 5.3 s to 0.80 s, with a 0.9 s recovery from the kidnap. A scatter is itself
+  a pose jump, so fewer of them means less post-convergence disturbance — though
+  this is a one-run-per-condition comparison and run-to-run spread is not separated.
+- Median error and goals match the old implementation; no regression is visible.
+
 ## Conditions
 
 Identical environment, robot, route and Nav2 configuration to
@@ -108,12 +166,21 @@ KIDNAP_AT=120 LOC=amcl_sup ./sim/run_nav2.sh out_sup  300
 - **Few runs.** Two per kidnap condition, one each for dynamic and static. The kidnap
   pair is consistent 2/2 (both unsupervised runs above 180 s, both supervised under
   8 s), but dynamic and static have a single run each.
-- **The supervisor fired only once.** Six runs establish that it does not misfire; a
-  single event is the whole evidence that it catches a broken AMCL. The thresholds
-  (`supervise_after_scans: 10`, `supervise_wfrac_excess: 0.15`) were **not tuned to
-  that event**, but neither are they statistically calibrated.
-- **The `initialpose_repeat` amplification is not fixed.** The repeats should stop
-  once AMCL is seen to have taken the pose; these numbers still carry all five.
+- **The supervisor fired only once in closed loop.** Six runs establish that it does
+  not misfire, and the thresholds are now backed by the synthetic calibration above
+  (0/1800 false fires, stable across the whole threshold grid). But the calibration
+  approximates "broken" as a pose displacement; it does not reproduce how a particle
+  filter actually degrades (multi-modality, covariance inflation). Closed-loop firing
+  events still need to accumulate.
+- **The `initialpose_repeat` amplification is now cut off by a receipt
+  acknowledgement** (after these measurements were taken): once a post-seed
+  `amcl_pose` lands near the seed, the remaining repeats are dropped
+  ([seed_handoff.hpp](../../include/oriented_field_localization/seed_handoff.hpp),
+  22 unit tests). Repeats also carry the seed forward by odometry before publishing
+  (a repeat while driving used to scatter at a stale pose). **The table above still
+  carries all five repeats**; the re-measurement with the acknowledgement is in the
+  section above — scatters fell 14 / 9 -> 3 (kidnap) and 4 -> 1 (static), with no
+  visible regression.
 - **One run in nine was invalid.** Nav2 dropped the action response for the first
   goal (`bt_navigator.rclcpp_action: Failed to send goal response (timeout)`), the
   driver waited the full 300 s and the robot never moved. It was excluded and redone.

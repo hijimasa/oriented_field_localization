@@ -128,7 +128,9 @@ ros2 service call \
 | `update_max_interval_s` | `1.0` | 停止していても この間隔では探索する `[s]` |
 | `use_odometry` | `true` | `/odom` で事前姿勢を伝播する |
 | `publish_initialpose` | `true` | 初回ロック (と追跡喪失後の再取得) で `/initialpose` を出す |
-| `initialpose_repeat` | `5` | `/initialpose` を出し直す回数。**購読者が居ない間は消費しない** |
+| `initialpose_repeat` | `5` | `/initialpose` を出し直す回数。**購読者が居ない間は消費しない**。再送はシードをオドメトリで現在姿勢へ運んでから出す |
+| `initialpose_ack_m` | `0.5` | 受領確認。シード後の `amcl_pose` がシードのこの距離以内に来たら**残りの再送を止める** (1 回の判断が repeat 回の撒き直しに増幅されるのを断つ)。`supervise_amcl` のときだけ働く |
+| `initialpose_ack_deg` | `20.0` | 同 `[deg]`。0 で角度は見ない |
 | `smooth_base_m` | `0.0` | **出力する姿勢だけ**を鈍らせる (内部の事前姿勢は生のまま)。0 で無効。穏やかに走る用途では `0.005` を推奨 |
 | `smooth_gain` | `0.5` | 補正権限のうち運動量に比例するぶん。固定上限だと激しい機動で遅れる |
 | `tf_mode` | `none` | `none` / `map_to_odom` (REP-105) / `map_to_base` |
@@ -161,11 +163,13 @@ colcon test --packages-select oriented_field_localization
 colcon test-result --verbose
 ```
 
-ROS 非依存の単体テストが 2 本あります。`test_matcher` (20 項目) はパラメータの
+ROS 非依存の単体テストが 3 本あります。`test_matcher` (20 項目) はパラメータの
 不変条件、既知姿勢の復元、候補プールの性質 (スコア降順・NMS 分離・上限)、WFRAC の
 符号、TRACK の引き込みと窓の境界を検査します。`test_reseed_policy` (21 項目) は
 AMCL 監視の判定 — 動く障害物で誤発火しないこと、姿勢が一致していれば撒き直さない
-こと、連続回数と最小間隔 — を検査します。
+こと、連続回数と最小間隔 — を検査します。`test_seed_handoff` (22 項目) は
+`/initialpose` の再送予算 — 購読者が居ない間は消費しないこと、AMCL の受領を
+確認したら残りを止めること — を検査します。
 
 ## Gazebo での連続走行検証
 
@@ -252,12 +256,17 @@ ros2 launch oriented_field_localization amcl_supervisor.launch.py \
 WFRAC そのものが 0.50 近くまで上がるためです。**同じスキャンで測った自分の WFRAC を
 基準線にしてその差を見る**と、障害物は両方の姿勢に同じだけ乗るので相殺されます。
 判定は [reseed_policy.hpp](include/oriented_field_localization/reseed_policy.hpp) に
-ROS 非依存で置いてあり、単体テストが 21 項目あります。
+ROS 非依存で置いてあり、単体テストが 21 項目あります。しきい値は 15 外乱条件 x
+各クラス 1,800 サンプルの合成較正で裏付けてあります (誤発火 0/1800、誤ロック帯の
+per-scan 検出 99.5%。`eval/run_reseed_margin.sh`、docs/amcl_supervision.md)。
 
 **再シードは無料ではありません。**`/initialpose` はパーティクルを撒き直すので、それ自体が
 姿勢の跳びを作り、局所 costmap が odom フレームにある以上は経路が無効になって
 `follow_path` が abort します。そのため判定は連続回数と最小間隔で鈍らせてあり、
 **AMCL が自分と同じ場所を指しているときは (起動時の引き継ぎを含めて) 再シードしません**。
+さらに `/initialpose` の再送は、AMCL がシード近傍の姿勢を出してきた時点で受領と
+みなして打ち切ります ([seed_handoff.hpp](include/oriented_field_localization/seed_handoff.hpp)。
+1 回の再シード判断が `initialpose_repeat` 回の撒き直しに増幅されるのを断つため)。
 
 ## 姉妹パッケージとの関係
 
@@ -276,7 +285,8 @@ TRACK の探索そのものに絞ってあります。
 oriented_field_localization/
 ├── include/oriented_field_localization/
 │   ├── oriented_field_matcher.hpp
-│   └── reseed_policy.hpp            # AMCL 監視の判定 (ROS 非依存)
+│   ├── reseed_policy.hpp            # AMCL 監視の判定 (ROS 非依存)
+│   └── seed_handoff.hpp             # /initialpose 再送予算と受領確認 (ROS 非依存)
 ├── src/
 │   ├── oriented_field_matcher.cpp   # ROS 非依存のマッチングライブラリ
 │   └── ofl_node.cpp                 # ROS 2 ノード
@@ -286,7 +296,8 @@ oriented_field_localization/
 ├── config/params.yaml
 ├── tests/
 │   ├── test_matcher.cpp
-│   └── test_reseed_policy.cpp
+│   ├── test_reseed_policy.cpp
+│   └── test_seed_handoff.cpp
 ├── sim/                             # Gazebo での連続走行検証
 │   ├── make_env.py                  # 壁の定義から world・地図・経路を生成
 │   ├── models/robot.urdf
@@ -303,7 +314,10 @@ oriented_field_localization/
 │   ├── bbs_eval.cpp                 # BBS ベースライン
 │   ├── make_synthetic_map.py
 │   ├── summarize.py
-│   └── run_compare.sh
+│   ├── run_compare.sh
+│   ├── reseed_margin_eval.cpp       # AMCL 監視しきい値の合成較正
+│   ├── summarize_reseed.py
+│   └── run_reseed_margin.sh
 ├── docker/                          # ビルド・テスト用の最小 ROS 2 環境
 └── docs/
     ├── design.md                    # 設計と既知の制約

@@ -62,6 +62,11 @@ if(BUILD_TESTING)
   add_executable(test_reseed_policy tests/test_reseed_policy.cpp)
   target_include_directories(test_reseed_policy PRIVATE include)
   add_test(NAME reseed_policy COMMAND test_reseed_policy)
+
+  # /initialpose 再送予算と受領確認。同じくヘッダだけ。
+  add_executable(test_seed_handoff tests/test_seed_handoff.cpp)
+  target_include_directories(test_seed_handoff PRIVATE include)
+  add_test(NAME seed_handoff COMMAND test_seed_handoff)
 endif()
 
 ament_package()
