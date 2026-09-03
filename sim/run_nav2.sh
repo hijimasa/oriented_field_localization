@@ -30,7 +30,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PKG="$(cd "${HERE}/.." && pwd)"
 OUT="${1:-${HERE}/out_nav2}"
 DURATION="${2:-300}"
-IMAGE="${IMAGE:-bac_gazebo_runtime:humble}"
+IMAGE="${IMAGE:-oriented-field-localization-sim:humble}"
 LOC="${LOC:-ofl}"
 
 mkdir -p "${OUT}"
@@ -56,6 +56,22 @@ docker run --rm --network none \
     -e "OMP_WAIT_POLICY=${OMP_WAIT_POLICY:-}" \
     --entrypoint /bin/bash "${IMAGE}" -lc '
 set -eo pipefail
+cleanup() {
+  status=$?
+  trap - EXIT INT TERM
+  mapfile -t pids < <(jobs -pr)
+  if [ "${#pids[@]}" -gt 0 ]; then
+    kill "${pids[@]}" 2>/dev/null || true
+    sleep 1
+    kill -KILL "${pids[@]}" 2>/dev/null || true
+    wait "${pids[@]}" 2>/dev/null || true
+  fi
+  exit "${status}"
+}
+trap cleanup EXIT
+trap "exit 130" INT
+trap "exit 143" TERM
+
 source /opt/ros/humble/setup.bash
 cd /ws
 colcon build --packages-select oriented_field_localization \
@@ -185,16 +201,53 @@ HARD=$(python3 -c "print(int(${DURATION} * 3 + 300))")
 timeout -k 20 "${HARD}" python3 ${SIM}/nav2_drive_node.py \
     --route /out/env/route.json --map /out/env/office.yaml \
     --out /out/run.csv --duration "${DURATION}" ${DYNARG} ${KID} ${CM} \
-    --ros-args -p use_sim_time:=true > /out/drive.log 2>&1 || true
-
-for p in gzserver ofl_node amcl map_server planner_server controller_server \
-         behavior_server bt_navigator lifecycle_manager robot_state_publisher \
-         obstacle_node.py gt_tf_node.py; do
-  pkill -f "${p}" 2>/dev/null || true
-done
-sleep 2
-exit 0
+    --ros-args -p use_sim_time:=true > /out/drive.log 2>&1
+python3 -c "import json,os;p=\"/out/run_events.json\";d=json.load(open(p));d[\"events\"].append({\"t\":float(os.environ[\"DURATION\"]),\"ev\":\"run_complete\"});open(p,\"w\").write(json.dumps(d,indent=2))"
 '
+}
+
+validate_output() {
+python3 - "${OUT}/run.csv" "${DURATION}" <<'PY'
+import csv
+import json
+import math
+import os
+import sys
+
+path, duration_text = sys.argv[1:]
+duration = float(duration_text)
+if duration <= 0:
+    raise SystemExit('duration_s must be positive')
+with open(path, newline='') as stream:
+    rows = list(csv.DictReader(stream))
+required = {'t', 'gt_x', 'gt_y', 'est_x', 'est_y', 'pos_err', 'yaw_err',
+            'goal_idx', 'wall_clr'}
+if not rows or not required.issubset(rows[0]):
+    raise SystemExit(f'run_nav2: invalid or empty CSV: {path}')
+minimum_rows = max(2, int(duration * 5))
+if len(rows) < minimum_rows:
+    raise SystemExit(f'run_nav2: only {len(rows)} rows; expected at least {minimum_rows}')
+try:
+    final_t = float(rows[-1]['t'])
+except (TypeError, ValueError):
+    raise SystemExit('run_nav2: final CSV timestamp is invalid')
+if not math.isfinite(final_t) or final_t < duration - 0.5:
+    raise SystemExit(f'run_nav2: stopped at {final_t:.3f}s before {duration:.3f}s')
+if not any(math.isfinite(float(row['pos_err'])) for row in rows
+           if row['pos_err'] not in ('', 'nan')):
+    raise SystemExit('run_nav2: CSV contains no finite localization estimate')
+events_path = os.path.splitext(path)[0] + '_events.json'
+with open(events_path) as stream:
+    report = json.load(stream)
+events = report.get('events', [])
+if report.get('nav_ready_t') is None or not any(e.get('ev') == 'nav_ready' for e in events):
+    raise SystemExit('run_nav2: completion report has no nav_ready event')
+if not any(e.get('ev') == 'goal_sent' for e in events):
+    raise SystemExit('run_nav2: completion report has no goal_sent event')
+if not any(e.get('ev') == 'run_complete' for e in events):
+    raise SystemExit('run_nav2: completion report has no run_complete event')
+print(f'[validate] {len(rows)} rows through {final_t:.3f}s; {len(events)} events')
+PY
 }
 
 # Nav2 の lifecycle 起動は稀に失敗する。configure 自体は通っているのに
@@ -207,20 +260,19 @@ RETRIES="${RETRIES:-2}"
 attempt=0
 while : ; do
   attempt=$((attempt + 1))
-  rm -f "${OUT}/run.csv"      # 前回の残りを成功と誤判定しない
-  run_once
-  # ヘッダのみ = 1 行なら失敗
-  if [ "$(wc -l < "${OUT}/run.csv" 2>/dev/null || echo 0)" -gt 1 ]; then
+  rm -f "${OUT}/run.csv" "${OUT}/run_events.json"
+  run_status=0
+  run_once || run_status=$?
+  if [ "${run_status}" -eq 0 ] && validate_output; then
     break
   fi
   if [ "${attempt}" -gt "${RETRIES}" ]; then
-    echo "run_nav2: ${attempt} 回試して起動できなかった (${OUT}/lm_nav.log を見ること)" >&2
-    break
+    echo "run_nav2: ${attempt} 回試して正常完了しなかった (各 log を見ること)" >&2
+    exit 1
   fi
-  echo "run_nav2: Nav2 が起動しなかった (${attempt} 回目)。やり直す" >&2
+  echo "run_nav2: 実行または出力検証に失敗 (${attempt} 回目, status=${run_status})。やり直す" >&2
   sleep 5
 done
 
 echo
-python3 "${HERE}/summarize_nav2.py" "${OUT}/run.csv" || true
-exit 0
+python3 "${HERE}/summarize_nav2.py" "${OUT}/run.csv"

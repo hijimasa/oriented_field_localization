@@ -7,7 +7,7 @@
 
 usage:
     summarize.py ofl=out/ofl.csv bbs=out/bbs.csv
-    summarize.py out/radon.csv                     # ラベル省略時はファイル名
+    summarize.py out/custom.csv                    # ラベル省略時はファイル名
 """
 import csv
 import sys
@@ -48,7 +48,7 @@ def main(argv):
         if not path:
             path, label = label, label.rsplit("/", 1)[-1].replace(".csv", "")
         rows = load(path)
-        # WFRAC ゲート列があれば併せて出す (radon 側のみ)
+        # WFRAC ゲート列があれば併せて出す
         variants = [(label, "pos_err", "ang_err")]
         if "wfrac_gate_pos_err" in rows[0]:
             variants.append((label + "+wfrac", "wfrac_gate_pos_err", "wfrac_gate_ang_err"))

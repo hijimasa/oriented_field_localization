@@ -9,14 +9,19 @@
 初期化・再初期化時は地図全体を探索し (GLOBAL)、収束後は事前姿勢の周りを局所探索で
 追い続けます (TRACK)。ICP 精密化・複数スキャン累積・内部オドメトリは持ちません。
 
-## 成績 (9 地図 x 15 外乱条件 x 40 姿勢 = 5400 試行)
+## 保存記録としての評価 (9 地図 x 15 外乱条件 x 40 姿勢 = 5400 試行)
+
+以下の表は過去に行った評価の記録であり、**この公開checkoutだけでは完全に
+再現できません**。5枚の地図は同梱されず、それらの入力hashとraw CSVも保存
+されていません。同梱した生成器とハーネスにより、手順の検証と固定seedの合成地図4枚で
+の新規対応比較は再現できます。公開物で再現できる範囲と実行手順は
+[benchmark文書](docs/benchmark.md)に明記しています。
 
 | 手法 | 成功率 | 1 スキャンあたり [s] |
 |---|---:|---:|
 | **本手法 GLOBAL** | **86.9%** | **0.010** (30x30 m 地図) / 0.025 (52x50 m) |
 | **本手法 TRACK** (事前誤差 <= 3 m / 30 度) | **96.6%** | **0.005** / 0.005 |
 | BBS (Olson/Hess 型 分枝限定相関) | 62.5% | 0.013 / 0.037 |
-| Radon サイノグラム法 (姉妹パッケージの最良構成) | 85.7% | 0.060 / 0.084 |
 
 Gazebo での連続走行 (240 秒・121 m) では**位置誤差 中央 0.04-0.06 m / 0.5 m 以内 100%
 (3 走行)**、kidnap から **0.7 秒で復帰**します ([docs/simulation.md](docs/simulation.md))。
@@ -53,7 +58,36 @@ s(p, alpha) = < f_map , R_alpha f_scan >_p / sqrt(E_scan)
 
 ## 依存関係
 
-ROS 2 / `ament_cmake`、OpenCV、OpenMP (任意)。PCL は不要です。
+必要な用途のprofileだけを導入します。PCLは不要です。
+
+- **ROS 2 core build** (Ubuntu 22.04、ROS 2のapt repository設定後):
+
+  ```bash
+  sudo apt update
+  sudo apt install build-essential cmake libopencv-dev libyaml-cpp-dev \
+    python3-colcon-common-extensions \
+    ros-humble-ament-cmake ros-humble-geometry-msgs ros-humble-nav-msgs \
+    ros-humble-rclcpp ros-humble-sensor-msgs ros-humble-std-srvs ros-humble-tf2 \
+    ros-humble-tf2-ros
+  ```
+
+- **単体の評価ハーネス**: `g++`、GCC同梱のOpenMP、`pkg-config`、OpenCV、Python 3、
+  NumPy。
+
+  ```bash
+  sudo apt install g++ libopencv-dev pkg-config python3 python3-numpy
+  ```
+
+- **Gazebo/Nav2 simulation**: Dockerがサポート対象の分離環境です。
+  `./sim/docker/build_image.sh`でimageを作るとsimulation stackとcore build依存が導入
+  されます。nativeで実行する場合はPython 3・NumPyと
+  [sim/docker/Dockerfile](sim/docker/Dockerfile)の同等ROS packageを導入します。
+
+- **動画生成のみ**:
+
+  ```bash
+  sudo apt install ffmpeg python3-matplotlib
+  ```
 
 ## ビルド
 
@@ -68,6 +102,9 @@ ROS を用意せずに検証する場合は Docker の最小環境で回せま�
 ./docker/run_ci.sh
 ```
 
+レビュー後にGit履歴を含まない公開用repositoryを作る場合は、
+[Public公開snapshotの手順](docs/public_release.md)に従います。
+
 ## 起動
 
 ```bash
@@ -76,13 +113,15 @@ ros2 launch oriented_field_localization global_localization.launch.py \
 ```
 
 `map_yaml_path` を空にすると transient-local / reliable QoS の `/map` を待ちます。
-推定はサービスで開始します。
+YAML指定時はmap_server互換の相対・絶対・引用符付きimage path、threshold、`negate`、
+`mode`、origin yawを扱います。推定はサービスで開始します。
 
 ```bash
 ros2 service call \
   /oriented_field_localization/global_localization std_srvs/srv/Empty '{}'
 ```
 
+サービス要求は、既定では3回のGLOBAL連続採択を経てTRACKへ移るまで有効です。
 スキャン受信ごとに自動実行する場合は `auto_localize: true` にします。
 
 ## ROS インターフェース
@@ -134,6 +173,8 @@ ros2 service call \
 | `smooth_base_m` | `0.0` | **出力する姿勢だけ**を鈍らせる (内部の事前姿勢は生のまま)。0 で無効。穏やかに走る用途では `0.005` を推奨 |
 | `smooth_gain` | `0.5` | 補正権限のうち運動量に比例するぶん。固定上限だと激しい機動で遅れる |
 | `tf_mode` | `none` | `none` / `map_to_odom` (REP-105) / `map_to_base` |
+| `tf_lookup_timeout_s` | `0.05` | scan時刻の`base_frame <- scan frame`を待つ上限 `[s]`。TFが無ければそのscanを棄却 |
+| `odom_sync_tolerance_s` | `0.1` | 補間範囲外で最近傍odomを許す時刻差 `[s]` |
 | `supervise_amcl` | `false` | true で **AMCL の監視役**になる (下記)。`tf_mode: none` と組で使う |
 
 重要な不変条件:
@@ -151,7 +192,7 @@ margin_pixels >= ceil(sqrt(2) * max_range / match_resolution) + 1      # 推奨
 
 - `pyramid_levels: 3` — 2 段は 2 倍遅く精度は同等
 - `coarse_angle_step: 6` — 3 度は +0.4 pt で 1.7 倍遅い。9 度以上は時間が減らず精度だけ落ちる
-- `wfrac_margin: 1.05` — 9 地図で較正。1.3 (サイノグラム法向けの値) を当てると -1 pt
+- `wfrac_margin: 1.05` — 保存記録の9地図評価で使った値。別の運用dataでは再較正が必要
 - `normal_weight: 1.0` — 0 (壁質量のみ) にすると -1.5 pt
 - スレッド数は**物理コア数**に合わせること。論理コア数まで上げると 2 次元 FFT が
   SMT で取り合いになり 1.4 倍遅くなります
@@ -163,13 +204,20 @@ colcon test --packages-select oriented_field_localization
 colcon test-result --verbose
 ```
 
-ROS 非依存の単体テストが 3 本あります。`test_matcher` (20 項目) はパラメータの
+ROS 非依存の単体テストが5本あります。`test_matcher` はパラメータの
 不変条件、既知姿勢の復元、候補プールの性質 (スコア降順・NMS 分離・上限)、WFRAC の
-符号、TRACK の引き込みと窓の境界を検査します。`test_reseed_policy` (21 項目) は
+符号、TRACK の引き込み、窓の境界、並行探索を検査します。`test_runtime_support`は
+サービス要求の寿命、LiDAR外部パラメータ、odom補間を、`test_map_yaml_loader`は
+map YAMLのpath・threshold・origin yaw・異常系を検査します。`test_reseed_policy` (21 項目) は
 AMCL 監視の判定 — 動く障害物で誤発火しないこと、姿勢が一致していれば撒き直さない
 こと、連続回数と最小間隔 — を検査します。`test_seed_handoff` (22 項目) は
 `/initialpose` の再送予算 — 購読者が居ない間は消費しないこと、AMCL の受領を
 確認したら残りを止めること — を検査します。
+
+install後は`oriented_field_matcher`と`map_yaml_loader`のSTATIC library、public header、
+CMake targetがexportされます。downstream側は`find_package(oriented_field_localization REQUIRED)`
+の後に`oriented_field_localization::oriented_field_matcher`または
+`oriented_field_localization::map_yaml_loader`へlinkできます。
 
 ## Gazebo での連続走行検証
 
@@ -224,9 +272,8 @@ BBS ベースラインと同一スキャンで比較する最小セットを [ev
 cd eval && ./run_compare.sh out 40
 ```
 
-`make_scans` の姿勢・外乱の乱数系列は姉妹パッケージ `radon_global_localization` の
-`disturb_eval2 --dump` と同一なので、同じ地図・同じ試行数なら**バイト同一のスキャン**が
-得られ、両パッケージの数値を直接並べられます。
+`make_scans` は姿勢サンプリングと外乱に固定 seed を使うため、同じ地図・同じ試行数から
+再現可能なスキャン集合を生成します。
 
 ## AMCL の監視役として使う
 
@@ -287,17 +334,6 @@ per-scan 検出 99.5%。`eval/run_reseed_margin.sh`、docs/amcl_supervision.md)�
 みなして打ち切ります ([seed_handoff.hpp](include/oriented_field_localization/seed_handoff.hpp)。
 1 回の再シード判断が `initialpose_repeat` 回の撒き直しに増幅されるのを断つため)。
 
-## 姉妹パッケージとの関係
-
-`radon_global_localization` は同じ表現をラドン変換 (サイノグラム) 空間で照合します。
-本パッケージはその**画像空間対照**として始まり、9 地図の比較で成功率・速度とも上回った
-ため独立させたものです。経緯・機構の分析・撤回した仮説は
-`radon_global_localization/docs/image_space_control.md` に記録されています。
-
-なお `radon_global_localization` は PLICP 精密化・内部オドメトリ (scan-to-scan ICP)・
-複数スキャン累積まで持つ**より作り込まれたパッケージ**です。本パッケージは GLOBAL と
-TRACK の探索そのものに絞ってあります。
-
 ## 構成
 
 ```text
@@ -341,7 +377,7 @@ oriented_field_localization/
 ├── docker/                          # ビルド・テスト用の最小 ROS 2 環境
 └── docs/
     ├── design.md                    # 設計と既知の制約
-    ├── benchmark.md                 # BBS / Radon との比較
+    ├── benchmark.md                 # BBS との比較
     ├── simulation.md                # Gazebo での連続走行検証 (開ループ)
     ├── nav2_closed_loop.md          # Nav2 との閉ループと動的障害物
     ├── amcl_supervision.md          # AMCL の監視と再シードの実測

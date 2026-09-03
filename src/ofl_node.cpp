@@ -7,8 +7,8 @@
 //   TRACK  --- max_consecutive_rejects 回連続で棄却 ---> GLOBAL
 //
 // TRACK の事前姿勢は「最後に採択した地図姿勢 + それ以降のオドメトリ差分」で、
-// オドメトリが無い場合は最後の採択姿勢をそのまま使う (スキャン間の移動が
-// track_search_m に収まる前提)。
+// スキャン時刻へ補間したオドメトリが得られない場合は、時刻の異なる姿勢を
+// 混ぜずにそのTRACK更新を棄却する。
 //
 // supervise_amcl: true にすると、自分で map -> odom を出す代わりに **AMCL を
 // 監視する**。AMCL の姿勢を毎スキャン WFRAC で検証し、壊れていると判断したときだけ
@@ -30,7 +30,9 @@
 // ではない (T_map_odom = T_map_base * T_odom_base^-1)。odom を出すノードが居ない
 // 構成のために tf_mode: map_to_base も用意してある。
 #include "oriented_field_localization/oriented_field_matcher.hpp"
+#include "oriented_field_localization/map_yaml_loader.hpp"
 #include "oriented_field_localization/reseed_policy.hpp"
+#include "oriented_field_localization/runtime_support.hpp"
 #include "oriented_field_localization/seed_handoff.hpp"
 
 #include <rclcpp/rclcpp.hpp>
@@ -42,12 +44,15 @@
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <std_srvs/srv/empty.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2/exceptions.h>
 
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
-#include <fstream>
+#include <stdexcept>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -56,7 +61,9 @@
 
 using oriented_field_localization::Beam;
 using oriented_field_localization::MatcherParams;
+using oriented_field_localization::OdomHistory;
 using oriented_field_localization::OrientedFieldLocalizer;
+using oriented_field_localization::Pose2D;
 using oriented_field_localization::PoseCandidate;
 using oriented_field_localization::ReseedEvidence;
 using oriented_field_localization::ReseedPolicy;
@@ -64,48 +71,21 @@ using oriented_field_localization::ReseedPolicyParams;
 using oriented_field_localization::reseedPosesDisagree;
 using oriented_field_localization::SeedHandoff;
 using oriented_field_localization::SeedHandoffParams;
+using oriented_field_localization::compose;
+using oriented_field_localization::inverse;
+using oriented_field_localization::localizationRequestCompletes;
+using oriented_field_localization::localizationShouldRun;
+using oriented_field_localization::relative;
+using oriented_field_localization::transformBeam;
+using oriented_field_localization::validateMatcherParams;
+using oriented_field_localization::wrapPi;
 
 namespace
 {
-/// 2D 姿勢 (地図 or オドメトリ座標)。
-struct Pose2D
-{
-  double x = 0, y = 0, yaw = 0;
-};
-
-double wrapPi(double a)
-{
-  while (a > M_PI) a -= 2 * M_PI;
-  while (a < -M_PI) a += 2 * M_PI;
-  return a;
-}
-
 double yawOf(const geometry_msgs::msg::Quaternion & q)
 {
   return std::atan2(2.0 * (q.w * q.z + q.x * q.y),
            1.0 - 2.0 * (q.y * q.y + q.z * q.z));
-}
-
-/// b を a の座標系から見た相対姿勢 (a^-1 * b)。
-Pose2D relative(const Pose2D & a, const Pose2D & b)
-{
-  const double c = std::cos(a.yaw), s = std::sin(a.yaw);
-  const double dx = b.x - a.x, dy = b.y - a.y;
-  return {c * dx + s * dy, -s * dx + c * dy, wrapPi(b.yaw - a.yaw)};
-}
-
-/// a に相対姿勢 d を掛ける (a * d)。
-Pose2D compose(const Pose2D & a, const Pose2D & d)
-{
-  const double c = std::cos(a.yaw), s = std::sin(a.yaw);
-  return {a.x + c * d.x - s * d.y, a.y + s * d.x + c * d.y, wrapPi(a.yaw + d.yaw)};
-}
-
-/// a^-1 (2D 剛体変換の逆)。
-Pose2D inverse(const Pose2D & a)
-{
-  const double c = std::cos(a.yaw), s = std::sin(a.yaw);
-  return {-(c * a.x + s * a.y), -(-s * a.x + c * a.y), wrapPi(-a.yaw)};
 }
 
 geometry_msgs::msg::Quaternion yawQuat(double yaw)
@@ -175,6 +155,12 @@ public:
     hp.wait_s = initialpose_wait_s_;
     hp.ack_m = declare_parameter("initialpose_ack_m", hp.ack_m);
     hp.ack_deg = declare_parameter("initialpose_ack_deg", hp.ack_deg);
+    if (hp.repeat < 1 || hp.wait_s < 0.0 || !std::isfinite(hp.wait_s) ||
+      hp.ack_m < 0.0 || !std::isfinite(hp.ack_m) ||
+      hp.ack_deg < 0.0 || !std::isfinite(hp.ack_deg))
+    {
+      throw std::invalid_argument("initialpose handoff parameters are invalid");
+    }
     handoff_ = SeedHandoff(hp);
     // AMCL はこの分散でパーティクルを撒き直す。既定は「この格子で解いた解の
     // 不確かさ」に相当する控えめな値で、絞りすぎると誤差を吸収できなくなる。
@@ -191,12 +177,20 @@ public:
       declare_parameter("supervise_min_disagreement_deg", rp.min_disagreement_deg);
     rp.after_scans = declare_parameter("supervise_after_scans", rp.after_scans);
     rp.min_interval_s = declare_parameter("supervise_min_interval_s", rp.min_interval_s);
+    if (!std::isfinite(rp.max_wfrac) || rp.max_wfrac < 0.0 || rp.max_wfrac > 1.0 ||
+      !std::isfinite(rp.wfrac_excess) || rp.wfrac_excess < 0.0 ||
+      !std::isfinite(rp.min_disagreement_m) || rp.min_disagreement_m < 0.0 ||
+      !std::isfinite(rp.min_disagreement_deg) || rp.min_disagreement_deg < 0.0 ||
+      rp.after_scans < 1 || !std::isfinite(rp.min_interval_s) || rp.min_interval_s < 0.0)
+    {
+      throw std::invalid_argument("AMCL supervision parameters are invalid");
+    }
     reseed_ = ReseedPolicy(rp);
     update_min_d_ = declare_parameter("update_min_d", 0.2);
     update_min_a_deg_ = declare_parameter("update_min_a_deg", 15.0);
     update_max_interval_s_ = declare_parameter("update_max_interval_s", 1.0);
     smooth_base_m_ = declare_parameter("smooth_base_m", 0.0);
-    smooth_gain_ = declare_parameter("smooth_gain", 0.0);
+    smooth_gain_ = declare_parameter("smooth_gain", 0.5);
     smooth_rot_lever_m_ = declare_parameter("smooth_rot_lever_m", 0.3);
     smooth_bypass_m_ = declare_parameter("smooth_bypass_m", 0.3);
     smooth_bypass_deg_ = declare_parameter("smooth_bypass_deg", 10.0);
@@ -205,10 +199,17 @@ public:
     odom_frame_ = declare_parameter("odom_frame", std::string("odom"));
     base_frame_ = declare_parameter("base_frame", std::string("base_link"));
     transform_tolerance_ = declare_parameter("transform_tolerance", 0.2);
+    tf_lookup_timeout_s_ = declare_parameter("tf_lookup_timeout_s", 0.05);
+    odom_sync_tolerance_s_ = declare_parameter("odom_sync_tolerance_s", 0.1);
     const std::string tf_mode = declare_parameter("tf_mode", std::string("none"));
-    tf_mode_ = tf_mode == "map_to_odom" ? TfMode::MapToOdom
-      : tf_mode == "map_to_base" ? TfMode::MapToBase : TfMode::None;
+    if (tf_mode == "none") tf_mode_ = TfMode::None;
+    else if (tf_mode == "map_to_odom") tf_mode_ = TfMode::MapToOdom;
+    else if (tf_mode == "map_to_base") tf_mode_ = TfMode::MapToBase;
+    else throw std::invalid_argument("tf_mode must be one of: none, map_to_odom, map_to_base");
     const std::string map_yaml = declare_parameter("map_yaml_path", std::string(""));
+
+    validateMatcherParams(p);
+    validateNodeParams();
 
     // margin は「テンプレートが地図の縁で切れない」ための下限を満たす必要がある。
     // 推奨値まで上げると相関の外挿が 0 になり、DFT も最小になる。
@@ -230,6 +231,8 @@ public:
     }
 
     localizer_ = std::make_unique<OrientedFieldLocalizer>(p);
+    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
     auto sensor_qos = rclcpp::SensorDataQoS().keep_last(1);
     scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
@@ -275,6 +278,7 @@ public:
         // 明示的な要求は追跡状態を捨てて GLOBAL からやり直す (kidnap 対応)
         std::lock_guard<std::mutex> lk(state_mu_);
         has_pose_ = false;
+        tracking_ = false;
         consecutive_accepts_ = 0;
         consecutive_rejects_ = 0;
         requested_ = true;
@@ -329,39 +333,50 @@ public:
   }
 
 private:
+  void validateNodeParams() const
+  {
+    const auto finite_nonnegative = [](double value) {
+        return std::isfinite(value) && value >= 0.0;
+      };
+    if (track_after_accepts_ < 1) {
+      throw std::invalid_argument("track_after_accepts must be >= 1");
+    }
+    if (max_consecutive_rejects_ < 1) {
+      throw std::invalid_argument("max_consecutive_rejects must be >= 1");
+    }
+    if (!finite_nonnegative(wfrac_margin_) || !finite_nonnegative(global_min_margin_) ||
+      !finite_nonnegative(max_accept_jump_m_) || !finite_nonnegative(max_accept_yaw_deg_) ||
+      !finite_nonnegative(track_max_wfrac_) || track_max_wfrac_ > 1.0)
+    {
+      throw std::invalid_argument("acceptance thresholds must be finite and nonnegative");
+    }
+    if (initialpose_repeat_ < 1 || initialpose_wait_s_ < 0 ||
+      !finite_nonnegative(initialpose_cov_xy_) || !finite_nonnegative(initialpose_cov_yaw_))
+    {
+      throw std::invalid_argument("initialpose repeat/wait/covariance values are invalid");
+    }
+    if (!finite_nonnegative(update_min_d_) || !finite_nonnegative(update_min_a_deg_) ||
+      !finite_nonnegative(update_max_interval_s_) || !finite_nonnegative(smooth_base_m_) ||
+      !finite_nonnegative(smooth_gain_) || !finite_nonnegative(smooth_rot_lever_m_) ||
+      !finite_nonnegative(smooth_bypass_m_) || !finite_nonnegative(smooth_bypass_deg_) ||
+      smooth_saturate_scans_ < 1)
+    {
+      throw std::invalid_argument("update and smoothing parameters must be finite and nonnegative");
+    }
+    if (!finite_nonnegative(transform_tolerance_) || !finite_nonnegative(tf_lookup_timeout_s_) ||
+      !finite_nonnegative(odom_sync_tolerance_s_))
+    {
+      throw std::invalid_argument("TF/odometry timing parameters must be finite and nonnegative");
+    }
+    if (map_frame_.empty() || odom_frame_.empty() || base_frame_.empty()) {
+      throw std::invalid_argument("map_frame, odom_frame, and base_frame must not be empty");
+    }
+  }
+
   void loadMapFromYaml(const std::string & yaml_path)
   {
-    // map_server 形式の最小パース (image / resolution / origin)
-    std::ifstream ifs(yaml_path);
-    if (!ifs.is_open()) {
-      RCLCPP_ERROR(get_logger(), "cannot open YAML: %s", yaml_path.c_str());
-      return;
-    }
-    std::string line, image_file;
-    double resolution = 0.05, ox = 0, oy = 0;
-    while (std::getline(ifs, line)) {
-      if (line.find("image:") != std::string::npos) {
-        image_file = line.substr(line.find(':') + 2);
-      } else if (line.find("resolution:") != std::string::npos) {
-        resolution = std::stod(line.substr(line.find(':') + 2));
-      } else if (line.find("origin:") != std::string::npos) {
-        const auto b = line.find('[');
-        const auto c1 = line.find(',', b);
-        const auto c2 = line.find(',', c1 + 1);
-        ox = std::stod(line.substr(b + 1, c1 - b - 1));
-        oy = std::stod(line.substr(c1 + 1, c2 - c1 - 1));
-      }
-    }
-    while (!image_file.empty() && (image_file.back() == ' ' || image_file.back() == '\r')) {
-      image_file.pop_back();
-    }
-    const std::string dir = yaml_path.substr(0, yaml_path.find_last_of('/'));
-    cv::Mat img = cv::imread(dir + "/" + image_file, cv::IMREAD_GRAYSCALE);
-    if (img.empty()) {
-      RCLCPP_ERROR(get_logger(), "failed to load map image: %s", image_file.c_str());
-      return;
-    }
-    setMap(img, resolution, ox, oy);
+    const auto map = oriented_field_localization::loadMapYaml(yaml_path);
+    setMap(map.image, map.resolution, map.origin_x, map.origin_y, map.origin_yaw);
   }
 
   void onMap(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
@@ -376,13 +391,14 @@ private:
     }
     cv::flip(image, image, 0);   // OccupancyGrid は行 0 が最小 y
     setMap(image, msg->info.resolution,
-      msg->info.origin.position.x, msg->info.origin.position.y);
+      msg->info.origin.position.x, msg->info.origin.position.y,
+      yawOf(msg->info.origin.orientation));
   }
 
-  void setMap(const cv::Mat & img, double res, double ox, double oy)
+  void setMap(const cv::Mat & img, double res, double ox, double oy, double oyaw)
   {
     const auto t0 = now();
-    localizer_->setMap(img, res, ox, oy);
+    localizer_->setMap(img, res, ox, oy, oyaw);
     map_ready_ = true;
     RCLCPP_INFO(get_logger(), "map %dx%d @ %.3f m/px loaded in %.2f s",
       img.cols, img.rows, res, (now() - t0).seconds());
@@ -393,6 +409,7 @@ private:
     std::lock_guard<std::mutex> lk(state_mu_);
     odom_ = {msg->pose.pose.position.x, msg->pose.pose.position.y,
       yawOf(msg->pose.pose.orientation)};
+    odom_history_.add(rclcpp::Time(msg->header.stamp).seconds(), odom_);
     has_odom_ = true;
   }
 
@@ -407,8 +424,8 @@ private:
       amcl_pose_ = amcl;
       // 受け取った時点のオドメトリを一緒に控える。AMCL の publish はこちらの
       // スキャンと非同期なので、比べるときはこの差分で今の時刻まで運ぶ。
-      odom_at_amcl_ = odom_;
-      had_odom_at_amcl_ = has_odom_;
+      had_odom_at_amcl_ = odom_history_.lookup(
+        rclcpp::Time(msg->header.stamp).seconds(), odom_sync_tolerance_s_, &odom_at_amcl_);
       has_amcl_ = true;
       odom_now = odom_;
       have_odom = has_odom_;
@@ -441,7 +458,9 @@ private:
     cv_.notify_one();
   }
 
-  static std::vector<Beam> toBeams(const sensor_msgs::msg::LaserScan & s, double max_range)
+  static std::vector<Beam> toBeams(
+    const sensor_msgs::msg::LaserScan & s, double max_range,
+    const Pose2D & base_from_scan)
   {
     std::vector<Beam> beams;
     beams.reserve(s.ranges.size());
@@ -449,9 +468,37 @@ private:
     for (size_t i = 0; i < s.ranges.size(); i++) {
       const double r = s.ranges[i];
       if (!std::isfinite(r) || r < s.range_min || r >= hi) continue;
-      beams.push_back({r, s.angle_min + s.angle_increment * static_cast<double>(i)});
+      beams.push_back(transformBeam(
+          {r, s.angle_min + s.angle_increment * static_cast<double>(i)}, base_from_scan));
     }
     return beams;
+  }
+
+  bool baseFromScan(const sensor_msgs::msg::LaserScan & scan, Pose2D * out)
+  {
+    if (!out) return false;
+    if (scan.header.frame_id.empty()) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "LaserScan has an empty frame_id; skipping");
+      return false;
+    }
+    if (scan.header.frame_id == base_frame_) {
+      *out = Pose2D();
+      return true;
+    }
+    try {
+      const auto tf = tf_buffer_->lookupTransform(
+        base_frame_, scan.header.frame_id, rclcpp::Time(scan.header.stamp),
+        rclcpp::Duration::from_seconds(tf_lookup_timeout_s_));
+      *out = {tf.transform.translation.x, tf.transform.translation.y,
+        yawOf(tf.transform.rotation)};
+      return true;
+    } catch (const tf2::TransformException & e) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "cannot transform LaserScan from '%s' to '%s' at scan time: %s; skipping",
+        scan.header.frame_id.c_str(), base_frame_.c_str(), e.what());
+      return false;
+    }
   }
 
   void workerLoop()
@@ -464,16 +511,18 @@ private:
         // 走る理由 = TRACK 中 / auto_localize / サービス要求。
         cv_.wait(lk, [this] {
             return stop_ || (pending_scan_ && map_ready_ &&
-              (requested_ || tracking_ || auto_localize_));
+              localizationShouldRun(requested_, auto_localize_, tracking_));
           });
         if (stop_) return;
         scan = pending_scan_;
         pending_scan_.reset();          // 1 枚のスキャンは 1 回だけ処理する
-        if (!(auto_localize_ || tracking_)) requested_ = false;
       }
       if (!scan) continue;
 
-      const std::vector<Beam> beams = toBeams(*scan, localizer_->params().max_range);
+      Pose2D base_from_scan;
+      if (!baseFromScan(*scan, &base_from_scan)) continue;
+      const std::vector<Beam> beams = toBeams(
+        *scan, localizer_->params().max_range, base_from_scan);
       if (beams.size() < 8) {
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
           "too few valid beams (%zu); skipping", beams.size());
@@ -484,16 +533,23 @@ private:
       Pose2D prior;
       Pose2D odom_now;
       bool have_prior = false;
+      bool have_odom = false;
       {
         std::lock_guard<std::mutex> lk(state_mu_);
-        odom_now = odom_;
+        have_odom = !use_odometry_ || odom_history_.lookup(
+          rclcpp::Time(scan->header.stamp).seconds(), odom_sync_tolerance_s_, &odom_now);
         if (has_pose_) {
           prior = last_pose_;
-          if (use_odometry_ && has_odom_ && had_odom_at_accept_) {
-            prior = compose(last_pose_, relative(odom_at_accept_, odom_));
+          if (use_odometry_ && have_odom && had_odom_at_accept_) {
+            prior = compose(last_pose_, relative(odom_at_accept_, odom_now));
           }
           have_prior = true;
         }
+      }
+      if (use_odometry_ && tracking_ && !have_odom) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "no odometry synchronized to scan stamp; skipping TRACK update");
+        continue;
       }
       const bool use_track = enable_track_ && tracking_ && have_prior;
 
@@ -520,7 +576,7 @@ private:
             PoseCandidate out;
             out.x = prior.x; out.y = prior.y; out.yaw = prior.yaw; out.score = 0;
             publishPose(out, odom_now, scan->header.stamp,
-              /*also_initialpose=*/false, /*snap=*/false, /*have_odom=*/true);
+              /*also_initialpose=*/false, /*snap=*/false, have_odom);
             // **監視は探索を間引いても毎スキャン走らせる。**AMCL が外れるのは
             // こちらが動いていない間かもしれないし、WFRAC は探索と桁が違って安い。
             superviseAmcl(out, w, beams, odom_now);
@@ -596,7 +652,7 @@ private:
       const bool reseed_ok = !supervise_amcl_ || amclDisagrees(best, odom_now);
 
       onAccept(best, odom_now, scan->header.stamp, use_track, margin, dt, cands.size(),
-        wfrac, reseed_ok);
+        wfrac, reseed_ok, have_odom);
 
       // **自分が TRACK で自己整合しているときだけ相手を裁く。**GLOBAL の単発解は
       // 曖昧解を引いている可能性があり、基準線として信用できない。
@@ -668,25 +724,24 @@ private:
   void onAccept(
     const PoseCandidate & best, const Pose2D & odom_now, const rclcpp::Time & stamp,
     bool was_track, double margin, double dt, size_t n_cands, double wfrac,
-    bool reseed_ok)
+    bool reseed_ok, bool have_odom)
   {
     bool became_track = false;
     bool first_lock = false;
-    bool have_odom = false;
     {
       std::lock_guard<std::mutex> lk(state_mu_);
-      have_odom = has_odom_;
       first_lock = !has_pose_;
       last_pose_ = {best.x, best.y, best.yaw};
       has_pose_ = true;
       odom_at_accept_ = odom_now;
-      had_odom_at_accept_ = has_odom_;
+      had_odom_at_accept_ = have_odom;
       consecutive_rejects_ = 0;
       consecutive_accepts_++;
       if (enable_track_ && !tracking_ && consecutive_accepts_ >= track_after_accepts_) {
         tracking_ = true;
         became_track = true;
       }
+      if (localizationRequestCompletes(enable_track_, tracking_)) requested_ = false;
     }
     // GLOBAL からの採択 (初回ロック・追跡喪失からの復帰) は平滑化せず即座に反映する
     publishPose(best, odom_now, stamp,
@@ -841,6 +896,11 @@ private:
     }
 
     if (!tf_broadcaster_) return;
+    if (tf_mode_ == TfMode::MapToOdom && !have_odom) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "no odometry synchronized to scan stamp; suppressing map->odom TF");
+      return;
+    }
     const rclcpp::Time tf_stamp =
       stamp + rclcpp::Duration::from_seconds(transform_tolerance_);
     geometry_msgs::msg::TransformStamped tf;
@@ -902,12 +962,14 @@ private:
   double update_min_a_deg_ = 15.0;      ///< 同 [deg]
   double update_max_interval_s_ = 1.0;  ///< 停止していても この間隔では探索する [s]
   double smooth_base_m_ = 0.0;          ///< 静止時の補正権限 [m/scan]。0 で無効
-  double smooth_gain_ = 0.0;            ///< 運動量に対する補正権限の比。0 で無効
+  double smooth_gain_ = 0.5;            ///< 運動量に対する補正権限の比。0 で無効
   double smooth_rot_lever_m_ = 0.3;     ///< 回転 [rad] を位置誤差 [m] に換算する腕
   double smooth_bypass_m_ = 0.3;
   double smooth_bypass_deg_ = 10.0;
   int smooth_saturate_scans_ = 5;
   double transform_tolerance_ = 0.2;
+  double tf_lookup_timeout_s_ = 0.05;
+  double odom_sync_tolerance_s_ = 0.1;
   TfMode tf_mode_ = TfMode::None;
   std::string map_frame_, odom_frame_, base_frame_;
 
@@ -916,12 +978,13 @@ private:
   std::atomic<bool> stop_{false};
   std::atomic<bool> tracking_{false};
 
-  std::mutex mu_;                     ///< last_scan_ / requested_
+  std::mutex mu_;                     ///< pending_scan_
   std::condition_variable cv_;
   sensor_msgs::msg::LaserScan::SharedPtr pending_scan_;
 
   std::mutex state_mu_;               ///< 追跡状態とオドメトリ
   Pose2D last_pose_, odom_, odom_at_accept_;
+  OdomHistory odom_history_;
   bool has_pose_ = false, has_odom_ = false, had_odom_at_accept_ = false;
   Pose2D out_pose_, out_odom_;          ///< 出力用 (平滑化後)。内部の事前姿勢とは別
   bool has_out_ = false, had_out_odom_ = false;
@@ -953,6 +1016,8 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr candidates_pub_;
   rclcpp::Service<std_srvs::srv::Empty>::SharedPtr service_;
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 };
 
 int main(int argc, char ** argv)

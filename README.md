@@ -10,14 +10,19 @@ It searches the whole map on initialisation and re-initialisation (GLOBAL), then
 the pose with a local search around a prior once converged (TRACK). There is no ICP
 refinement, no multi-scan accumulation, and no internal odometry.
 
-## Results (9 maps x 15 disturbance conditions x 40 poses = 5400 trials)
+## Archived evaluation (9 maps x 15 conditions x 40 poses = 5,400 trials)
+
+The following table records the original evaluation. It is **not fully reproducible from this
+public checkout**: five maps are not bundled, and neither the raw CSV files nor hashes of those
+inputs were archived. The bundled generator and harness do reproduce the protocol and support a
+fresh paired comparison on four deterministic synthetic maps. See the precise artifact boundary
+and commands in [the English benchmark document](docs/en/benchmark.md).
 
 | Method | Success | Per scan [s] |
 |---|---:|---:|
 | **This package, GLOBAL** | **86.9%** | **0.010** (30x30 m map) / 0.025 (52x50 m) |
 | **This package, TRACK** (prior error <= 3 m / 30 deg) | **96.6%** | **0.005** / 0.005 |
 | BBS (Olson/Hess branch-and-bound correlative matching) | 62.5% | 0.013 / 0.037 |
-| Radon sinogram method (sibling package, best configuration) | 85.7% | 0.060 / 0.084 |
 
 In a continuous Gazebo drive (240 s, 121 m) it holds a **median error of 0.04-0.06 m with 100%
 within 0.5 m across three runs**, and recovers from a kidnap in **0.7 s**
@@ -31,7 +36,7 @@ Success is "position error < 1.0 m and angle error < 15 deg". McNemar against BB
 p = 1.6e-278. **Inside its window, TRACK pulls in regardless of how large the prior error
 is**, and it helps most on the self-similar corridor maps (50.7% -> 84.5%). **Its time does
 not depend on the map size.** The per-map and per-condition breakdown, and the limits, are in
-**[docs/benchmark.md](docs/benchmark.md)**.
+**[docs/en/benchmark.md](docs/en/benchmark.md)**.
 
 **BBS has a completeness guarantee and this method does not.** The gap is therefore not
 about exhaustiveness but about score discrimination: the BBS likelihood field only asks
@@ -54,11 +59,40 @@ which destroys comparability between candidates and costs about 12 pt of top-1 a
 The search is a coarse-to-fine image pyramid. The coarse stage gets **the score at every
 position** from one inverse DFT per angle and keeps the top NMS'd peaks per angle; the fine
 stage refines each candidate over a narrow angle and position window by direct correlation
-over a sparse point list. See [docs/design.md](docs/design.md).
+over a sparse point list. See [docs/en/design.md](docs/en/design.md).
 
 ## Dependencies
 
-ROS 2 / `ament_cmake`, OpenCV, OpenMP (optional). PCL is not needed.
+Choose only the profile you need. The package does not require PCL.
+
+- **Core ROS 2 build (Ubuntu 22.04, after configuring the ROS 2 apt repository):**
+
+  ```bash
+  sudo apt update
+  sudo apt install build-essential cmake libopencv-dev libyaml-cpp-dev \
+    python3-colcon-common-extensions \
+    ros-humble-ament-cmake ros-humble-geometry-msgs ros-humble-nav-msgs \
+    ros-humble-rclcpp ros-humble-sensor-msgs ros-humble-std-srvs ros-humble-tf2 \
+    ros-humble-tf2-ros
+  ```
+
+- **Standalone evaluation harness:** `g++`, OpenMP (provided by GCC), `pkg-config`, OpenCV,
+  Python 3, and NumPy.
+
+  ```bash
+  sudo apt install g++ libopencv-dev pkg-config python3 python3-numpy
+  ```
+
+- **Gazebo/Nav2 simulation:** Docker is the supported, isolated setup. Build the image with
+  `./sim/docker/build_image.sh`; its Dockerfile installs the simulation stack and core build
+  dependencies. A native installation should install Python 3 and NumPy plus the equivalent ROS
+  packages listed in [sim/docker/Dockerfile](sim/docker/Dockerfile).
+
+- **Video rendering only:**
+
+  ```bash
+  sudo apt install ffmpeg python3-matplotlib
+  ```
 
 ## Build
 
@@ -73,6 +107,9 @@ To verify without a local ROS installation, use the minimal Docker environment:
 ./docker/run_ci.sh
 ```
 
+For a history-free public repository after release review, follow
+[the public snapshot procedure](docs/en/public_release.md).
+
 ## Running
 
 ```bash
@@ -80,14 +117,17 @@ ros2 launch oriented_field_localization global_localization.launch.py \
   map_yaml_path:=/absolute/path/to/map.yaml
 ```
 
-Leave `map_yaml_path` empty to wait for a transient-local / reliable `/map`. Trigger a
-search with the service:
+Leave `map_yaml_path` empty to wait for a transient-local / reliable `/map`. The YAML path
+supports map_server-compatible relative, absolute, and quoted image paths, thresholds,
+`negate`, `mode`, and origin yaw. Trigger a search with the service:
 
 ```bash
 ros2 service call \
   /oriented_field_localization/global_localization std_srvs/srv/Empty '{}'
 ```
 
+By default the request remains active through three consecutive GLOBAL accepts, then hands
+control to TRACK.
 Set `auto_localize: true` to run on every incoming scan.
 
 ## ROS interface
@@ -139,6 +179,8 @@ Set `auto_localize: true` to run on every incoming scan.
 | `smooth_base_m` | `0.0` | damp **only the published pose** (the internal prior stays raw); 0 disables. `0.005` is recommended for gentle motion |
 | `smooth_gain` | `0.5` | the part of the correction authority that scales with motion; a fixed cap lags during aggressive maneuvering |
 | `tf_mode` | `none` | `none` / `map_to_odom` (REP-105) / `map_to_base` |
+| `tf_lookup_timeout_s` | `0.05` | maximum wait for `base_frame <- scan frame` at the scan timestamp `[s]`; the scan is rejected if unavailable |
+| `odom_sync_tolerance_s` | `0.1` | allowed timestamp gap for nearest odometry outside the interpolation range `[s]` |
 | `supervise_amcl` | `false` | true makes this node **supervise AMCL** (see below); pair it with `tf_mode: none` |
 
 Important invariants:
@@ -157,8 +199,8 @@ correlation padding zero and the coarse DFT minimal; missing it can double the c
 - `pyramid_levels: 3` — two levels are 2x slower at the same accuracy
 - `coarse_angle_step: 6` — 3 deg buys 0.4 pt for 1.7x the time; 9 deg and above lose
   accuracy without saving time
-- `wfrac_margin: 1.05` — calibrated over nine maps; using 1.3 (the sinogram method's value)
-  costs about 1 pt
+- `wfrac_margin: 1.05` — value used in the archived nine-map evaluation; recalibrate for a new
+  deployment dataset
 - `normal_weight: 1.0` — dropping to 0 (wall mass only) costs 1.5 pt
 - Size the thread count by **physical** cores: going to the logical core count makes the
   2-D FFTs contend over SMT and runs 1.4x slower
@@ -170,14 +212,22 @@ colcon test --packages-select oriented_field_localization
 colcon test-result --verbose
 ```
 
-There are three ROS-independent unit tests. `test_matcher` (20 checks) covers the parameter
+There are five ROS-independent unit tests. `test_matcher` covers the parameter
 invariants, recovery of known poses, the candidate pool's properties (score ordering, NMS
-separation, size cap), the sign of WFRAC, and TRACK's pull-in and window boundary.
+separation, size cap), the sign of WFRAC, TRACK's pull-in and window boundary, and concurrent
+searches. `test_runtime_support` covers the service-request lifetime, LiDAR extrinsics, and
+odometry interpolation. `test_map_yaml_loader` covers map paths, thresholds, origin yaw, and
+error handling.
 `test_reseed_policy` (21 checks) covers the AMCL supervision rule — that dynamic obstacles
 do not trigger it, that a pose AMCL already agrees with is never reseeded, and the
 consecutive-hit count and minimum interval. `test_seed_handoff` (22 checks) covers the
 `/initialpose` repeat budget — that it is not spent while there is no subscriber, and that
 an acknowledged seed stops the remaining repeats.
+
+The install exports the `oriented_field_matcher` and `map_yaml_loader` static libraries,
+public headers, and CMake targets. After `find_package(oriented_field_localization REQUIRED)`,
+a downstream project can link `oriented_field_localization::oriented_field_matcher` or
+`oriented_field_localization::map_yaml_loader`.
 
 ## Continuous-drive validation in Gazebo
 
@@ -233,9 +283,8 @@ scans. No third-party dataset is bundled, so it generates a synthetic map.
 cd eval && ./run_compare.sh out 40
 ```
 
-`make_scans` uses the same random sequence for poses and disturbances as
-`disturb_eval2 --dump` in the sibling `radon_global_localization` package, so the same map
-and trial count give **byte-identical scans** and the two packages' numbers line up.
+`make_scans` uses fixed seeds for pose sampling and disturbances, so the same map and trial
+count produce a reproducible scan set.
 
 ## Using it to supervise AMCL
 
@@ -301,18 +350,6 @@ at the same place we do**. The repeats themselves are also cut off as soon as AM
 a pose near the seed ([seed_handoff.hpp](include/oriented_field_localization/seed_handoff.hpp) —
 one reseed decision must not amplify into `initialpose_repeat` scatters).
 
-## Relationship to the sibling package
-
-`radon_global_localization` matches the same representation in Radon (sinogram) space. This
-package started as its **image-space control** and was split out after a nine-map comparison
-put it ahead on both success rate and speed. The history, the mechanism, and the hypotheses
-that were retracted are recorded in
-`radon_global_localization/docs/image_space_control.md`.
-
-Note that `radon_global_localization` is a **more built-out package**, with PLICP
-refinement, internal scan-to-scan odometry, and multi-scan accumulation. This package
-focuses on the GLOBAL and TRACK searches themselves.
-
 ## Layout
 
 ```text
@@ -353,7 +390,7 @@ oriented_field_localization/
 ├── docker/                          # minimal ROS 2 environment for build and test
 └── docs/
     ├── design.md                    # design and known limits
-    ├── benchmark.md                 # comparison against BBS / Radon
+    ├── benchmark.md                 # comparison against BBS
     ├── simulation.md                # continuous-drive validation (open loop)
     ├── nav2_closed_loop.md          # closed loop with Nav2, and dynamic obstacles
     ├── amcl_supervision.md          # supervising AMCL and reseeding it, measured

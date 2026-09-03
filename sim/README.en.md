@@ -122,7 +122,7 @@ comparison). The links are `kinematic`, so teleporting them does not break physi
 collide.
 
 Needs an image with Gazebo Classic and `gazebo_ros` (set `IMAGE`; default
-`bac_gazebo_runtime:humble`). No network required (it runs with `--network none`).
+`oriented-field-localization-sim:humble`). No network required (it runs with `--network none`).
 
 Outputs are `out/run.csv` (a 20 Hz time series) plus each process's log; closed-loop runs also write
 `run_events.json` (goals sent and their outcome). Summarize with `summarize_run.py` /

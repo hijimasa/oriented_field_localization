@@ -1,8 +1,15 @@
-# ベンチマーク — BBS / Radon サイノグラム法との比較
+# ベンチマーク — BBS との比較
 
 [English](en/benchmark.md) | 日本語
 
 測定日: 2026-09-01
+
+> [!IMPORTANT]
+> この文書の9地図・5400試行の数値は**archival result (過去の評価記録)**である。
+> 公開物には5枚の地図、それらの入手・生成手順、raw scan/result CSV、入力hashが
+> 含まれないため、全体数値と統計検定はこのrepositoryだけからは再現できない。
+> 公開物で再現できるのは、固定seedの合成地図4枚の生成、15外乱条件のscan生成、
+> OFL/BBSの対応比較と集計である。下の「再現できる範囲」に手順を示す。
 
 ## 何と比べたか
 
@@ -10,10 +17,8 @@
 |---|---|---|
 | **本手法 (OFL)** | 画像空間で向き付き場 (壁質量 + 観測側法線) を FFT 相関、ピラミッド粗密探索 | ○ |
 | **BBS** | Olson (2009) / Hess (2016) 型の相関型分枝限定。尤度場 + 多重解像度で地図全域 x 全 360 度を探索し、**探索窓内の最大スコア姿勢を必ず見つける** | ○ (`eval/bbs_eval.cpp`) |
-| Radon サイノグラム法 | 姉妹パッケージ `radon_global_localization` の NCC-HF | × (数値のみ引用) |
 
-BBS は同一のスキャンダンプを読むので**対応比較**になる。Radon 側は別パッケージの
-評価器で同じスキャン集合を解いた結果を引用する (再現手順は末尾)。
+BBS は同一のスキャンダンプを読むので**対応比較**になる。
 
 ## 測定条件
 
@@ -31,7 +36,7 @@ BBS は同一のスキャンダンプを読むので**対応比較**になる。
   (物理コア数。論理 32 まで上げると 2 次元 FFT が SMT で取り合いになり 1.4 倍遅くなる)
 - 有意差は McNemar (二項正確検定、両側)
 
-## 結果
+## Archival result
 
 | 地図 | OFL top-1 | **OFL + WFRAC** | BBS | OFL [s] | BBS [s] |
 |---|---:|---:|---:|---:|---:|
@@ -53,7 +58,7 @@ McNemar (BBS 対 OFL+WFRAC): **OFL だけ成功 1453 / BBS だけ成功 136、p 
 スコアの識別力の差**である。BBS の尤度場は「スキャン点が壁の近くにあるか」しか見ないが、
 本手法は壁の**向き**まで一致を要求する。
 
-### 条件別 (全地図プール、5400 試行)
+### 条件別 (全地図プール、5400 試行、archival)
 
 | 条件 | OFL top-1 | OFL + WFRAC | BBS |
 |---|---:|---:|---:|
@@ -69,7 +74,8 @@ McNemar (BBS 対 OFL+WFRAC): **OFL だけ成功 1453 / BBS だけ成功 136、p 
 
 ### 至近レンジゲートの影響
 
-`min_range` (この値より近い返り値を捨てる) を 0 と 0.8 m で測った (5400 試行):
+`min_range` (この値より近い返り値を捨てる) を 0 と 0.8 m で測った
+(5400 試行のarchival result):
 
 | | min_range = 0 | min_range = 0.8 m |
 |---|---:|---:|
@@ -88,6 +94,7 @@ McNemar (BBS 対 OFL+WFRAC): **OFL だけ成功 1453 / BBS だけ成功 136、p 
 
 収束後の局所探索を、同じ 5400 スキャンに対して**真姿勢を乱数で崩した事前姿勢**
 (オドメトリ誤差の模擬) を与えて測った。
+これもraw CSVを同梱しないarchival resultである。
 
 | 地図 | GLOBAL | TRACK (事前誤差 <= 1 m / 10 度) | TRACK (<= 3 m / 30 度) | GLOBAL [ms] | TRACK [ms] |
 |---|---:|---:|---:|---:|---:|
@@ -113,33 +120,10 @@ McNemar (BBS 対 OFL+WFRAC): **OFL だけ成功 1453 / BBS だけ成功 136、p 
 とは違う。**ドリフトが溜まる状況での追従と kidnap からの復帰は Gazebo で別に測った
 ([simulation.md](simulation.md))。動的障害物の連続的な影響はどちらでも測っていない。
 
-### Radon サイノグラム法との比較
-
-姉妹パッケージ `radon_global_localization` の評価器で**同じ 5400 スキャン**を解いた値
-(WFRAC のしきい値は手法ごとに較正済み、同じ 16 スレッド):
-
-| 構成 | 成功率 | 時間 [s] 合成 / intel_log / 廊下 |
-|---|---:|---:|
-| Radon 実機既定相当 (levels=2) | 85.2% | 0.070 / 0.104 / 0.051 |
-| Radon levels=3 | 84.3% | 0.053 / 0.065 / 0.044 |
-| Radon 最良 (levels=3 + 粗段の位置格子 step 2) | 85.7% | 0.060 / 0.084 / 0.045 |
-| Radon 最速 (+ サイノグラム行数半減) | 84.2% | 0.025 / 0.035 / 0.020 |
-| **本手法 (OFL + WFRAC)** | **86.9%** | **0.010 / 0.025 / 0.007** |
-
-**成功率で +1.2〜2.7 pt、速度で 2.5〜6 倍**である。両者は表現 (壁質量 + 観測側法線) を
-共有しており、違うのは照合を**サイノグラム空間で行うか画像空間で行うか**だけである。
-経緯と機構の分析は `radon_global_localization/docs/image_space_control.md` にある。要点:
-
-- サイノグラム空間では「位置」が索引ではなく 180 行を横切る正弦波経路なので、
-  位置探索を FFT に落とせず粗い格子 (step 4) に頼る必要がある。画像空間の FFT 相関は
-  全位置のスコア場をそのまま返す。
-- **同じ候補集合の上で比べても画像空間のスコアのほうが良い選別器である**
-  (画像空間が出した候補を Radon のスコアで並べ直すと 85.2% → 73.5%)。
-  差は候補生成ではなく順位付けにある。
-
 ## 限界
 
-- **9 地図・5400 試行はこの設定の中では十分だが一般化ではない。**センサは 360 ビーム・
+- **Archivalな9地図・5400試行は一般化を示さない。**入力一式を公開できず、
+  第三者が完全に再現できない。センサは 360 ビーム・
   10 m の 1 種類、`match_resolution` も 0.05 固定である。廊下地図 3 枚は 15 x 16 m
   しかなく、10 m のスキャンが地図の大半を覆うので「局所パッチ 対 地図全体」という
   前提から外れている。
@@ -157,23 +141,27 @@ McNemar (BBS 対 OFL+WFRAC): **OFL だけ成功 1453 / BBS だけ成功 136、p 
   ([simulation.md](simulation.md))。**その検証で「跳び判定だけでは誤ロックを検出
   できない」という欠陥が見つかり、WFRAC ゲートを足して直した。**
 
-## 再現
+## 再現できる範囲
+
+公開物に含まれるのは、source、合成地図生成器、固定seed
+`7 / 11 / 23 / 42`、scan・外乱生成器、OFL/BBS評価器、集計scriptである。
+これらにより、同一生成scanを使う対応比較を新たに実行できる。まず既定seed
+7の合成地図1枚で一連の手順を確認する:
 
 ```bash
 cd eval
-./run_compare.sh out 40          # 合成地図 1 枚で OFL と BBS を比較
+./run_compare.sh out 40          # seed 7の合成地図1枚、600試行
 ```
 
-9 地図の表を再現するには、`eval/make_synthetic_map.py --seed {7,11,23,42}` で 4 枚を
-作り、Intel 地図と廊下地図は各自で用意して、地図ごとに
+公開再現可能な4枚を実行する場合は、seedごとに別の出力先を使う:
 
 ```bash
-OFL_MAP_PGM=<map>.pgm OFL_MAP_RES=<res> OFL_NEAR_WALL_M=8 ./out/make_scans 40 > scans.csv
-OFL_MAP_RES=<res> OFL_MIN_RANGE=0.8 ./out/ofl_eval scans.csv <map>.pgm > ofl.csv
-OFL_MAP_RES=<res> ./out/bbs_eval scans.csv <map>.pgm 1.0 0.05 0.8 > bbs.csv
-python3 summarize.py ofl=ofl.csv bbs=bbs.csv
+for seed in 7 11 23 42; do
+  python3 make_synthetic_map.py "out-s${seed}/maps" --seed "${seed}"
+  OFL_MAP_PGM="out-s${seed}/maps/synthetic.pgm" ./run_compare.sh "out-s${seed}" 40
+done
 ```
 
-を回す。`make_scans` の姿勢・外乱の乱数系列は `radon_global_localization` の
-`disturb_eval2 --dump` と同一なので、**同じ地図・同じ試行数なら両パッケージで
-バイト同一のスキャンが得られる** (Radon 側の数値と直接並べられる)。
+`make_scans` は姿勢サンプリングと外乱に固定 seed を使うため、**同じ地図・
+同じ試行数から再現可能なスキャン集合を生成する**。一方、同梱されない5枚の
+地図の各行、9地図のpooled値、条件別値、McNemarの値は本公開物の再現可能範囲外である。

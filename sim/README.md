@@ -121,7 +121,7 @@ python3 sim/compare_nav2.py OFL=out_nav2 AMCL=out_amcl 真値=out_gt
 teleport しても物理が破綻せず、衝突はする。
 
 Gazebo Classic と `gazebo_ros` を持つイメージが要る (`IMAGE` で指定、既定は
-`bac_gazebo_runtime:humble`)。ネットワークは不要 (`--network none` で回る)。
+`oriented-field-localization-sim:humble`)。ネットワークは不要 (`--network none` で回る)。
 
 出力は `out/run.csv` (20 Hz の時系列) と各プロセスのログ。閉ループでは
 `run_events.json` (目標の送受と成否) も出る。要約は `summarize_run.py` /

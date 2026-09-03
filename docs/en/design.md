@@ -41,9 +41,8 @@ template-side energy.
 
 **Keeping the denominator template-side only is the key point.** Dividing also by the
 map-side energy at the candidate position (a cosine normalisation) rebuilds the reference
-signal per candidate, which destroys comparability between candidates and degrades the
-ranking: top-1 measured 85.2% without it and 73.1% with it
-(`radon_global_localization/docs/image_space_control.md`, section 5).
+signal per candidate and destroys comparability between candidates, so normalization stays
+template-side only.
 
 ## Search
 
@@ -63,10 +62,7 @@ fine levels (0.1 -> 0.05 m/px)
   (intermediate_pool_size at intermediate levels, candidate_pool_size at the last)
 ```
 
-**Getting the whole position score field at once is what this formulation buys.** Matching
-the same representation in sinogram space makes a position a sinusoid across 180 rows rather
-than an index, which cannot be reduced to an FFT over position and has to be sampled on a
-coarse grid. That difference shows up in the results (benchmark.md).
+**Getting the whole position score field at once is what this formulation buys.**
 
 ### The correlation padding can be minimal
 
@@ -135,17 +131,16 @@ Only when the top-1 and top-2 scores are within `wfrac_margin` of each other doe
 the smallest value. When the scores are not close, nothing is touched: it is a tie-break,
 not a selector.
 
-The threshold 1.05 was calibrated over nine maps and amounts to "almost never fires". The
-sinogram method depends on WFRAC for +4.4 pt; this method gains only +1.4 pt, because its
-top-1 is already strong.
+The threshold 1.05 was calibrated over nine maps and amounts to "almost never fires". At
+this setting WFRAC improves pooled success from 85.6% to 86.9%.
 
-`global_min_margin` suppresses publishing when top1/top2 falls below it; the default 1.0 is
-effectively off. Raise it where a wrong commit is costly.
+`global_min_margin` suppresses publishing when top1/top2 falls below it. Its default is 1.05;
+recalibrate it for the ambiguities in the deployment dataset.
 
 ## Coordinates and conventions
 
 - Image coordinates are x right, y down. The conversion to world folds in the map origin,
-  the resolution, and the y flip
+  origin yaw, resolution, and y flip
 - The scan grid puts the sensor at the centre pixel and rotates with the same sign as the
   world yaw (because image y points down, a positive `getRotationMatrix2D` angle is the yaw)
 - `OccupancyGrid` has row 0 at minimum y, so it is flipped on load to match the map_server
@@ -175,9 +170,7 @@ effectively off. Raise it where a wrong commit is costly.
 - Long corridors and periodic wall layouts give several poses the same observation. An
   ambiguity that one scan cannot resolve needs odometry, motion, or another sensor (the
   49-83% success on the corridor maps is that limit being measured)
-- The coarse cost scales with **map area x angle count**, while the sinogram method's scales
-  with the map diameter, so **a large enough map should eventually favour the latter**
-  (it does not flip up to 52 x 50 m)
+- The coarse cost scales with **map area x angle count**, so larger maps cost more
 - A large map costs precomputation memory and initialisation time (three channels of
   spectra per level)
 - Finite range, occlusion, and map-versus-site differences break the ideal correlation

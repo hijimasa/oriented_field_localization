@@ -148,7 +148,7 @@ int main(int argc, char ** argv)
     auto te = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(te - ts).count();
 
-    const auto & st = loc.lastStageTimes();
+    const auto st = loc.lastStageTimes();
     acc.repr += st.repr; acc.xform += st.xform; acc.prep += st.prep;
     acc.corr += st.corr; acc.peak += st.peak; acc.fine += st.fine;
     n_scans++;

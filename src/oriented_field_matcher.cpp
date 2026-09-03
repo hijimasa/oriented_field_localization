@@ -9,6 +9,8 @@ static inline int omp_get_max_threads() { return 1; }
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <mutex>
+#include <stdexcept>
 
 namespace oriented_field_localization
 {
@@ -153,12 +155,13 @@ struct OrientedFieldLocalizer::Impl
   MatcherParams p;
   bool has_map = false;
   double map_res = 0.05;
-  double origin_x = 0.0, origin_y = 0.0;
+  double origin_x = 0.0, origin_y = 0.0, origin_yaw = 0.0;
   int map_rows_l0 = 0;
   cv::Mat map_image;      ///< 原解像度のグレースケール
   cv::Mat wall_dt;        ///< 占有画素への距離変換 [px]
   std::vector<Level> levels;
   StageTimes stage;
+  mutable std::mutex search_mutex;  ///< 探索とその計測値を同一 instance 内で直列化
 
   // ---- スキャン -> 壁二値グリッド (壁 255、背景 0、3x3 dilate) ----
   cv::Mat scanToGrid(const std::vector<Beam> & beams) const
@@ -429,11 +432,16 @@ struct OrientedFieldLocalizer::Impl
     const double inv_eb = 1.0 / std::sqrt(TC.Eb);
 
     // 事前姿勢を粗段の画素へ落とす (toWorld の逆写像)
-    const double px = (prior.x - origin_x) / LC.res;
-    const double py = LC.map_h - 1 - (prior.y - origin_y) / LC.res;
+    const double dx = prior.x - origin_x, dy = prior.y - origin_y;
+    const double co = std::cos(origin_yaw), so = std::sin(origin_yaw);
+    const double local_x = co * dx + so * dy;
+    const double local_y = -so * dx + co * dy;
+    const double px = local_x / LC.res;
+    const double py = LC.map_h - 1 - local_y / LC.res;
     const int cu = static_cast<int>(std::lround(px)) + LC.margin;
     const int cv_ = static_cast<int>(std::lround(py)) + LC.margin;
-    int prior_deg = static_cast<int>(std::lround(prior.yaw * 180.0 / CV_PI));
+    int prior_deg = static_cast<int>(
+      std::lround((prior.yaw - origin_yaw) * 180.0 / CV_PI));
     prior_deg = ((prior_deg % 360) + 360) % 360;
 
     const int SR = std::max(1, static_cast<int>(std::lround(p.track_search_m / LC.res)));
@@ -562,9 +570,12 @@ struct OrientedFieldLocalizer::Impl
     double px = c.u - L0.margin;
     double py = c.v - L0.margin;
     PoseCandidate out;
-    out.x = px * p.match_resolution + origin_x;
-    out.y = (L0.map_h - 1 - py) * p.match_resolution + origin_y;
-    out.yaw = c.angle * CV_PI / 180.0;
+    const double local_x = px * p.match_resolution;
+    const double local_y = (L0.map_h - 1 - py) * p.match_resolution;
+    const double co = std::cos(origin_yaw), so = std::sin(origin_yaw);
+    out.x = origin_x + co * local_x - so * local_y;
+    out.y = origin_y + so * local_x + co * local_y;
+    out.yaw = std::remainder(c.angle * CV_PI / 180.0 + origin_yaw, 2.0 * CV_PI);
     out.score = c.score;
     return out;
   }
@@ -574,14 +585,65 @@ struct OrientedFieldLocalizer::Impl
 // 公開 API
 // =============================================================================
 
+void validateMatcherParams(const MatcherParams & params)
+{
+  const auto finite = [](double v) {return std::isfinite(v);};
+  if (!finite(params.match_resolution) || params.match_resolution <= 0.0) {
+    throw std::invalid_argument("match_resolution must be finite and > 0");
+  }
+  if (!finite(params.max_range) || params.max_range <= 0.0) {
+    throw std::invalid_argument("max_range must be finite and > 0");
+  }
+  if (!finite(params.min_range) || params.min_range < 0.0 || params.min_range >= params.max_range) {
+    throw std::invalid_argument("min_range must be finite, >= 0, and < max_range");
+  }
+  if (params.margin_pixels < 0) throw std::invalid_argument("margin_pixels must be >= 0");
+  if (params.pyramid_levels < 1 || params.pyramid_levels > 8) {
+    throw std::invalid_argument("pyramid_levels must be in [1, 8]");
+  }
+  if (params.coarse_angle_step < 1 || params.coarse_angle_step > 180 ||
+    360 % params.coarse_angle_step != 0)
+  {
+    throw std::invalid_argument("coarse_angle_step must divide 360 and be in [1, 180]");
+  }
+  if (params.peaks_per_angle < 1 || params.peaks_per_angle > 10000 ||
+    params.candidate_pool_size < 1 || params.candidate_pool_size > 10000 ||
+    params.intermediate_pool_size < 1 || params.intermediate_pool_size > 10000)
+  {
+    throw std::invalid_argument("candidate pool sizes must be in [1, 10000]");
+  }
+  if (params.refine_angle_window < 0 || params.refine_angle_window > 180 ||
+    params.track_angle_window_deg < 0 || params.track_angle_window_deg > 180)
+  {
+    throw std::invalid_argument("angle windows must be in [0, 180]");
+  }
+  if (!finite(params.refine_search_m) || params.refine_search_m < 0.0 ||
+    !finite(params.nms_separation_m) || params.nms_separation_m < 0.0 ||
+    !finite(params.track_search_m) || params.track_search_m < 0.0)
+  {
+    throw std::invalid_argument("search and NMS distances must be finite and >= 0");
+  }
+  if (params.nms_separation_deg < 0 || params.nms_separation_deg > 180) {
+    throw std::invalid_argument("nms_separation_deg must be in [0, 180]");
+  }
+  if (!finite(params.normal_weight) || params.normal_weight < 0.0 ||
+    !finite(params.mass_weight) || params.mass_weight < 0.0 ||
+    (params.normal_weight == 0.0 && params.mass_weight == 0.0))
+  {
+    throw std::invalid_argument("matcher weights must be finite and at least one must be > 0");
+  }
+  if (!finite(params.map_normal_sigma) || params.map_normal_sigma <= 0.0 ||
+    !finite(params.wfrac_tolerance_m) || params.wfrac_tolerance_m < 0.0)
+  {
+    throw std::invalid_argument("map_normal_sigma must be > 0 and wfrac_tolerance_m >= 0");
+  }
+}
+
 OrientedFieldLocalizer::OrientedFieldLocalizer(const MatcherParams & params)
 : impl_(new Impl())
 {
+  validateMatcherParams(params);
   impl_->p = params;
-  if (impl_->p.pyramid_levels < 1) impl_->p.pyramid_levels = 1;
-  if (impl_->p.coarse_angle_step < 1 || 360 % impl_->p.coarse_angle_step != 0) {
-    impl_->p.coarse_angle_step = 6;
-  }
 }
 
 OrientedFieldLocalizer::~OrientedFieldLocalizer() = default;
@@ -591,14 +653,24 @@ OrientedFieldLocalizer & OrientedFieldLocalizer::operator=(
 
 bool OrientedFieldLocalizer::hasMap() const { return impl_->has_map; }
 const MatcherParams & OrientedFieldLocalizer::params() const { return impl_->p; }
-const OrientedFieldLocalizer::StageTimes & OrientedFieldLocalizer::lastStageTimes() const
+OrientedFieldLocalizer::StageTimes OrientedFieldLocalizer::lastStageTimes() const
 {
+  std::lock_guard<std::mutex> lock(impl_->search_mutex);
   return impl_->stage;
 }
 
 void OrientedFieldLocalizer::setMap(
-  const cv::Mat & map_img, double map_resolution, double origin_x, double origin_y)
+  const cv::Mat & map_img, double map_resolution, double origin_x, double origin_y,
+  double origin_yaw)
 {
+  if (map_img.empty() || map_img.type() != CV_8UC1) {
+    throw std::invalid_argument("map_img must be a non-empty CV_8UC1 image");
+  }
+  if (!std::isfinite(map_resolution) || map_resolution <= 0.0 ||
+    !std::isfinite(origin_x) || !std::isfinite(origin_y) || !std::isfinite(origin_yaw))
+  {
+    throw std::invalid_argument("map resolution/origin must be finite and resolution > 0");
+  }
   Impl & I = *impl_;
   const MatcherParams & p = I.p;
   I.has_map = false;
@@ -606,6 +678,7 @@ void OrientedFieldLocalizer::setMap(
   I.map_res = map_resolution;
   I.origin_x = origin_x;
   I.origin_y = origin_y;
+  I.origin_yaw = origin_yaw;
 
   // WFRAC 用: 原解像度の占有画素への距離変換
   {
@@ -772,6 +845,7 @@ std::vector<PoseCandidate> OrientedFieldLocalizer::localize(
   const std::vector<Beam> & beams) const
 {
   Impl & I = *impl_;
+  std::lock_guard<std::mutex> lock(I.search_mutex);
   I.stage = StageTimes();
   if (!I.has_map || beams.empty()) return {};
   const int kc = static_cast<int>(I.levels.size()) - 1;
@@ -801,6 +875,7 @@ std::vector<PoseCandidate> OrientedFieldLocalizer::track(
   const std::vector<Beam> & beams, const PoseCandidate & prior) const
 {
   Impl & I = *impl_;
+  std::lock_guard<std::mutex> lock(I.search_mutex);
   I.stage = StageTimes();
   if (!I.has_map || beams.empty()) return {};
   const int kc = static_cast<int>(I.levels.size()) - 1;
@@ -841,8 +916,12 @@ double OrientedFieldLocalizer::wallMissFraction(
     double sx = b.range * std::cos(b.bearing), sy = b.range * std::sin(b.bearing);
     double X = pose.x + sx * ca - sy * sa;
     double Y = pose.y + sx * sa + sy * ca;
-    int px = static_cast<int>((X - I.origin_x) / I.map_res);
-    int py = I.map_image.rows - 1 - static_cast<int>((Y - I.origin_y) / I.map_res);
+    const double dx = X - I.origin_x, dy = Y - I.origin_y;
+    const double co = std::cos(I.origin_yaw), so = std::sin(I.origin_yaw);
+    const double local_x = co * dx + so * dy;
+    const double local_y = -so * dx + co * dy;
+    int px = static_cast<int>(local_x / I.map_res);
+    int py = I.map_image.rows - 1 - static_cast<int>(local_y / I.map_res);
     n++;
     // レンジ比例の許容 (sin 0.5 deg 相当) を足す
     double tol = p.wfrac_tolerance_m + b.range * 0.00873;

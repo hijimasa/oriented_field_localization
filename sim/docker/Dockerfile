@@ -5,7 +5,12 @@
 # コンテナの中で colcon build する (run_nav2.sh を参照)。
 #
 #   ./sim/docker/build_image.sh
-FROM ros:humble-ros-base
+# core CIと同じ、2026-09-03検証済みのmulti-architecture manifestへ固定する。
+ARG ROS_BASE_IMAGE=ros:humble-ros-base@sha256:75dd3aba34a3838dadbb31a9f7bef769bdfa8713e6cec686fc868db2981b0987
+FROM ${ROS_BASE_IMAGE}
+ARG ROS_BASE_IMAGE
+LABEL org.opencontainers.image.base.name="${ROS_BASE_IMAGE}"
+ENV OFL_ROS_BASE_IMAGE="${ROS_BASE_IMAGE}"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -14,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       cmake \
       python3-colcon-common-extensions \
       libopencv-dev \
+      libyaml-cpp-dev \
       ros-humble-gazebo-ros-pkgs \
       ros-humble-gazebo-plugins \
       ros-humble-navigation2 \

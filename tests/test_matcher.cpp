@@ -4,6 +4,8 @@
 
 #include <cmath>
 #include <cstdio>
+#include <future>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -87,6 +89,18 @@ int main()
     "推奨マージンは下限以上");
   check(p.minimumMargin() == static_cast<int>(std::ceil(p.max_range / p.match_resolution)),
     "下限マージン = ceil(max_range / match_resolution)");
+  {
+    MatcherParams bad = p;
+    bad.match_resolution = 0.0;
+    bool rejected = false;
+    try {OrientedFieldLocalizer invalid(bad);} catch (const std::invalid_argument &) {rejected = true;}
+    check(rejected, "ゼロの match_resolution を fail-fast で棄却する");
+    bad = p;
+    bad.pyramid_levels = 100;
+    rejected = false;
+    try {OrientedFieldLocalizer invalid(bad);} catch (const std::invalid_argument &) {rejected = true;}
+    check(rejected, "極端な pyramid_levels を fail-fast で棄却する");
+  }
 
   printf("== 地図の設定 ==\n");
   OrientedFieldLocalizer loc(p);
@@ -94,6 +108,20 @@ int main()
   check(loc.localize({}).empty(), "地図が無ければ候補を返さない");
   loc.setMap(map, res, ox, oy);
   check(loc.hasMap(), "setMap 後は hasMap() が true");
+  {
+    cv::Mat yaw_map(100, 100, CV_8UC1, cv::Scalar(255));
+    // local map (2, 3) の壁は origin yaw=90deg により world (7, 22) へ写る。
+    yaw_map.at<uint8_t>(99 - 30, 20) = 0;
+    OrientedFieldLocalizer yaw_loc(p);
+    yaw_loc.setMap(yaw_map, 0.1, 10.0, 20.0, M_PI / 2.0);
+    PoseCandidate origin_pose;
+    origin_pose.x = 10.0;
+    origin_pose.y = 20.0;
+    origin_pose.yaw = M_PI / 2.0;
+    const std::vector<Beam> one_wall{{std::hypot(2.0, 3.0), std::atan2(3.0, 2.0)}};
+    check(yaw_loc.wallMissFraction(origin_pose, one_wall) == 0.0,
+      "origin yaw を world->map 変換へ適用する");
+  }
 
   printf("== 既知姿勢の復元 ==\n");
   const std::vector<GT> gts = {
@@ -155,7 +183,7 @@ int main()
     }
 
     printf("== 段階別の計測 ==\n");
-    const auto & st = loc.lastStageTimes();
+    const auto st = loc.lastStageTimes();
     check(st.total() > 0, "段階別の所要時間が記録される");
   }
 
@@ -216,6 +244,29 @@ int main()
     far_prior.yaw = 0.0;
     check(loc.track(beams, far_prior).empty(), "地図の外の事前姿勢では空を返す");
     check(loc.track({}, far_prior).empty(), "ビームが無ければ空を返す");
+  }
+
+  printf("== 同一 instance への並行探索 ==\n");
+  {
+    const GT & g = gts[0];
+    const std::vector<Beam> beams =
+      castScan(map, res, ox, oy, g.x, g.y, g.yaw, p.max_range);
+    PoseCandidate prior;
+    prior.x = g.x + 0.4;
+    prior.y = g.y - 0.3;
+    prior.yaw = g.yaw + 5.0 * M_PI / 180.0;
+    auto global_future = std::async(std::launch::async, [&loc, &beams]() {
+        return loc.localize(beams);
+      });
+    auto track_future = std::async(std::launch::async, [&loc, &beams, prior]() {
+        return loc.track(beams, prior);
+      });
+    const auto global = global_future.get();
+    const auto tracked = track_future.get();
+    check(!global.empty() && !tracked.empty(),
+      "localize() と track() を同一 instance に並行呼び出せる");
+    check(loc.lastStageTimes().total() > 0.0,
+      "並行呼び出し後も完了した探索の計測 snapshot を返す");
   }
 
   printf("\n=====================================\n");

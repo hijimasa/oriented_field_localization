@@ -189,6 +189,8 @@
     tf_mode: "none"              # none / map_to_odom / map_to_base
                                  # map_to_odom は REP-105 準拠 (use_odometry 必須)
     transform_tolerance: 0.2     # TF を先付けする時間 [s]
+    tf_lookup_timeout_s: 0.05    # scan時刻の base_frame <- scan frame を待つ上限 [s]
+    odom_sync_tolerance_s: 0.1   # 補間範囲外で最近傍odomを許す最大時刻差 [s]
     map_frame: "map"
     odom_frame: "odom"
     base_frame: "base_link"

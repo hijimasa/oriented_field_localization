@@ -3,8 +3,7 @@
 // Matching"; Hess et al., ICRA 2016 "Real-Time Loop Closure in 2D LIDAR SLAM"
 // §IV.C branch-and-bound).
 //
-// Reads the *same* dumped disturbance scans that the radon evaluator and CBGL
-// are given (eval_disturbance/scans_dump.csv), searches the whole map over the
+// Reads the *same* dumped disturbance scans as the OFL evaluator, searches the whole map over the
 // full 360 deg, and writes cond,trial,gt,est,score,time to stdout.
 //
 // build:
@@ -30,7 +29,7 @@ static double g_trunc = 0.50;      // likelihood-field truncation [m]
 static double g_max_range = 10.0;  // sensor max range [m]
 static int g_levels = 7;           // branch-and-bound depth (2^7 = 128 cells)
 static double g_angle_step_deg = 0;  // 0 => Cartographer's rule from max range
-// Same close-range gate the radon side uses (min_template_range): returns
+// Same close-range gate the OFL evaluator uses (min_range): returns
 // closer than this are dropped, so a wall pressed against the sensor cannot
 // dominate the score.  0 disables it.
 static double g_min_range = 0.0;
@@ -387,7 +386,7 @@ int main(int argc, char** argv) {
         }
         if (!ok) continue;
 
-        // valid returns only (max range == no return, same rule as the radon side)
+        // valid returns only (max range == no return, same rule as the OFL evaluator)
         std::vector<double> bx, by;
         for (int i = 0; i < kNumBeams; i++) {
             if (ranges[i] >= g_max_range - 0.01 || ranges[i] < 0.05) continue;

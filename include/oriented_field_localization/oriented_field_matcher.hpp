@@ -76,8 +76,13 @@ struct MatcherParams
   int recommendedMargin() const;
 };
 
+/// Validate all matcher parameters without allocating matcher state.
+void validateMatcherParams(const MatcherParams & params);
+
 /// 地図側の前計算を保持し、スキャンごとの探索を提供する。
-/// setMap() は起動時に 1 回だけ呼ぶ (重い)。localize() はスレッドセーフ。
+/// setMap() は起動時に、他の API を呼ぶ前に 1 回だけ呼ぶ (重い)。
+/// setMap() 完了後の localize() と track() は、同一 instance に並行して
+/// 呼び出せる (内部で直列化される)。
 class OrientedFieldLocalizer
 {
 public:
@@ -86,7 +91,8 @@ public:
   /// 地図を設定して前計算する。map_img は map_server 規約のグレースケール
   /// (占有 < 89、自由 > 205、行 0 が上端 = 最大 y)。
   void setMap(
-    const cv::Mat & map_img, double map_resolution, double origin_x, double origin_y);
+    const cv::Mat & map_img, double map_resolution, double origin_x, double origin_y,
+    double origin_yaw = 0.0);
 
   bool hasMap() const;
   const MatcherParams & params() const;
@@ -111,7 +117,8 @@ public:
     const std::vector<PoseCandidate> & cands, const std::vector<Beam> & beams,
     double margin_thresh) const;
 
-  /// 診断用: 1 スキャンあたりの段階別所要時間 [ms] (localize() が更新する)。
+  /// 診断用: 1 スキャンあたりの段階別所要時間 [ms]
+  /// (localize() または track() が更新する)。
   struct StageTimes
   {
     double repr = 0;   ///< スキャン -> 壁画像・法線
@@ -122,7 +129,8 @@ public:
     double fine = 0;   ///< 細段 refine
     double total() const { return repr + xform + prep + corr + peak + fine; }
   };
-  const StageTimes & lastStageTimes() const;
+  /// 最近完了した localize() または track() の値の snapshot を返す。
+  StageTimes lastStageTimes() const;
 
   ~OrientedFieldLocalizer();
   OrientedFieldLocalizer(OrientedFieldLocalizer &&) noexcept;

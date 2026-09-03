@@ -1,8 +1,16 @@
-# Benchmark — against BBS and the Radon sinogram method
+# Benchmark — against BBS
 
 English | [日本語](../benchmark.md)
 
 Measured: 2026-09-01
+
+> [!IMPORTANT]
+> The nine-map, 5,400-trial numbers in this document are an **archival evaluation record**.
+> Five maps, their acquisition or generation procedures, the raw scan/result CSV files, and
+> input hashes are not in the public artifact. The pooled values and statistical test therefore
+> cannot be reproduced from this repository alone. What is publicly reproducible is generation
+> of four fixed-seed synthetic maps, the 15-condition scan generation, a fresh paired OFL/BBS
+> run, and its summary. Commands are under "Publicly reproducible scope" below.
 
 ## What is compared
 
@@ -10,10 +18,8 @@ Measured: 2026-09-01
 |---|---|---|
 | **This method (OFL)** | FFT correlation of an oriented field (wall mass + sensor-facing normals) in image space, coarse-to-fine over an image pyramid | yes |
 | **BBS** | Olson (2009) / Hess (2016) style correlative branch-and-bound: a likelihood field plus a multi-resolution bound, searched over the whole map and all 360 degrees, **guaranteed to find the highest-scoring pose in the window** | yes (`eval/bbs_eval.cpp`) |
-| Radon sinogram method | NCC-HF from the sibling package `radon_global_localization` | no (numbers quoted) |
 
-BBS reads the same dumped scans, so that comparison is **paired**. The Radon numbers come
-from the sibling package's evaluator run on the same scan set (reproduction at the end).
+BBS reads the same dumped scans, so that comparison is **paired**.
 
 ## Conditions
 
@@ -33,7 +39,7 @@ from the sibling package's evaluator run on the same scan set (reproduction at t
   core count; going to 32 logical makes the 2-D FFTs contend over SMT and runs 1.4x slower)
 - Significance by McNemar (exact binomial, two-sided)
 
-## Results
+## Archival results
 
 | Map | OFL top-1 | **OFL + WFRAC** | BBS | OFL [s] | BBS [s] |
 |---|---:|---:|---:|---:|---:|
@@ -55,7 +61,7 @@ window) and this method does not. The gap is therefore not about exhaustiveness 
 **score discrimination**: the BBS likelihood field only asks whether a scan point lies near
 a wall, while this method also requires the wall **orientation** to agree.
 
-### Per condition (pooled, 5400 trials)
+### Per condition (pooled, 5,400 trials; archival)
 
 | Condition | OFL top-1 | OFL + WFRAC | BBS |
 |---|---:|---:|---:|
@@ -71,7 +77,8 @@ surrounded by people or carts); the narrowest are `dropout180` and `thin90`.
 
 ### Effect of the close-range gate
 
-`min_range` (discard returns closer than this) measured at 0 and 0.8 m, 5400 trials:
+`min_range` (discard returns closer than this) measured at 0 and 0.8 m in the archival
+5,400-trial run:
 
 | | min_range = 0 | min_range = 0.8 m |
 |---|---:|---:|
@@ -90,6 +97,7 @@ cutting it uniformly on a small platform throws away real information.
 
 The local search used after convergence, measured on the same 5400 scans by giving it a
 **prior perturbed at random from ground truth** (a stand-in for odometry error).
+This is also an archival result; its raw CSV is not bundled.
 
 | Map | GLOBAL | TRACK (prior error <= 1 m / 10 deg) | TRACK (<= 3 m / 30 deg) | GLOBAL [ms] | TRACK [ms] |
 |---|---:|---:|---:|---:|---:|
@@ -115,35 +123,11 @@ The local search used after convergence, measured on the same 5400 scans by givi
 error.** Following under accumulated drift and recovery from a kidnap are measured separately in
 Gazebo ([simulation.md](simulation.md)). Sustained dynamic obstacles are measured nowhere.
 
-### Against the Radon sinogram method
-
-The sibling package's evaluator on **the same 5400 scans** (WFRAC threshold calibrated per
-method, same 16 threads):
-
-| Configuration | Success | Time [s] synthetic / intel_log / corridor |
-|---|---:|---:|
-| Radon, deployed default (levels=2) | 85.2% | 0.070 / 0.104 / 0.051 |
-| Radon levels=3 | 84.3% | 0.053 / 0.065 / 0.044 |
-| Radon, best (levels=3 + coarse position grid step 2) | 85.7% | 0.060 / 0.084 / 0.045 |
-| Radon, fastest (+ halved sinogram rows) | 84.2% | 0.025 / 0.035 / 0.020 |
-| **This method (OFL + WFRAC)** | **86.9%** | **0.010 / 0.025 / 0.007** |
-
-**+1.2 to +2.7 pt in success and 2.5-6x in speed.** The two share the representation (wall
-mass + sensor-facing normals) and differ only in whether the matching happens in **sinogram
-space or image space**. The history and the mechanism are in
-`radon_global_localization/docs/image_space_control.md`. In short:
-
-- In sinogram space a position is not an index but a sinusoid across 180 rows, so the
-  position search cannot be reduced to an FFT and has to use a coarse grid (step 4). The
-  image-space FFT correlation returns the whole position field for free.
-- **Even on the same candidate set, the image-space score is the better discriminator**
-  (feeding image-space candidates through the Radon score drops top-1 from 85.2% to 73.5%).
-  The difference is in the ranking, not in candidate generation.
-
 ## Limits
 
-- **Nine maps and 5400 trials is enough within this setting, but it is not a
-  generalisation.** The sensor is one configuration (360 beams, 10 m) and
+- **The archival nine-map, 5,400-trial result is not a generalisation.** Its complete inputs
+  are unavailable for independent reproduction. The sensor is one configuration
+  (360 beams, 10 m) and
   `match_resolution` is fixed at 0.05. The three corridor maps are only 15 x 16 m, so a 10 m
   scan covers most of the map — outside the "local patch vs whole map" assumption.
 - **The BBS implementation is an evaluation baseline**, not Cartographer's own: a
@@ -160,24 +144,28 @@ space or image space**. The history and the mechanism are in
   Gazebo ([simulation.md](simulation.md)). **That validation found the defect that a jump gate
   cannot detect a wrong lock, which was fixed by adding the WFRAC gate.**
 
-## Reproduction
+## Publicly reproducible scope
+
+The public artifact contains the source, synthetic-map generator, fixed seeds
+`7 / 11 / 23 / 42`, scan/disturbance generator, OFL/BBS evaluators, and summary script. These
+support a new paired comparison on identical generated scans. First verify the complete path on
+the default seed-7 map:
 
 ```bash
 cd eval
-./run_compare.sh out 40          # OFL vs BBS on one synthetic map
+./run_compare.sh out 40          # one seed-7 map, 600 trials
 ```
 
-To reproduce the nine-map table, generate the four synthetic maps with
-`eval/make_synthetic_map.py --seed {7,11,23,42}`, supply the Intel and corridor maps
-yourself, and per map run
+To run all four publicly reproducible maps, use a separate output directory for each seed:
 
 ```bash
-OFL_MAP_PGM=<map>.pgm OFL_MAP_RES=<res> OFL_NEAR_WALL_M=8 ./out/make_scans 40 > scans.csv
-OFL_MAP_RES=<res> OFL_MIN_RANGE=0.8 ./out/ofl_eval scans.csv <map>.pgm > ofl.csv
-OFL_MAP_RES=<res> ./out/bbs_eval scans.csv <map>.pgm 1.0 0.05 0.8 > bbs.csv
-python3 summarize.py ofl=ofl.csv bbs=bbs.csv
+for seed in 7 11 23 42; do
+  python3 make_synthetic_map.py "out-s${seed}/maps" --seed "${seed}"
+  OFL_MAP_PGM="out-s${seed}/maps/synthetic.pgm" ./run_compare.sh "out-s${seed}" 40
+done
 ```
 
-`make_scans` uses the same random sequence for poses and disturbances as
-`disturb_eval2 --dump` in `radon_global_localization`, so **the same map and trial count
-give byte-identical scans in both packages** and the numbers can be placed side by side.
+`make_scans` uses fixed seeds for pose sampling and disturbances, so **the same map and trial
+count produce a reproducible scan set**. The five unbundled map rows, pooled nine-map values,
+per-condition pooled values, and McNemar result remain outside the reproducible scope of this
+public artifact.
