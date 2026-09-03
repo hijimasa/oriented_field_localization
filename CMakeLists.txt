@@ -57,6 +57,11 @@ if(BUILD_TESTING)
     target_link_libraries(test_matcher OpenMP::OpenMP_CXX)
   endif()
   add_test(NAME matcher_invariants COMMAND test_matcher)
+
+  # AMCL 監視の判定。ヘッダだけなので OpenCV も ROS も要らない。
+  add_executable(test_reseed_policy tests/test_reseed_policy.cpp)
+  target_include_directories(test_reseed_policy PRIVATE include)
+  add_test(NAME reseed_policy COMMAND test_reseed_policy)
 endif()
 
 ament_package()

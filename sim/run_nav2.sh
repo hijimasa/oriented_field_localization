@@ -7,9 +7,11 @@
 # 航法スタックの設定は 3 条件で完全に同一なので、差は位置推定に帰属する。
 #
 # 環境変数:
-#   LOC        ofl (既定) / amcl / gt / amcl_ofl  … map->odom を出すのは誰か
+#   LOC        ofl (既定) / amcl / gt / amcl_ofl / amcl_sup … map->odom を出すのは誰か
 #              amcl_ofl は「OFL で初期姿勢を与え、以降は AMCL が追う」構成
-#              (ofl_node は TF を出さず /initialpose だけを出す)
+#              (ofl_node は TF を出さず /initialpose を初回だけ出す)
+#              amcl_sup はそれに**監視**を足した構成。OFL が AMCL の姿勢を毎スキャン
+#              WFRAC で検証し、壊れていると判断したら撒き直させる (supervise_amcl)
 #   DYNAMIC    1 で地図に無い動く障害物を置く
 #   KIDNAP_AT  この秒数で瞬間移動させる
 #   IMAGE      Gazebo Classic + gazebo_ros + nav2 を持つ docker イメージ
@@ -86,10 +88,14 @@ case "${LOC}" in
   gt)
     python3 ${SIM}/gt_tf_node.py --ros-args -p use_sim_time:=true > /out/loc.log 2>&1 &
     ;;
-  amcl_ofl)
+  amcl_ofl | amcl_sup)
     # AMCL には初期姿勢を与えない。OFL が最初に採択した姿勢を /initialpose へ
-    # 流し、そこから AMCL が追う (publish_initialpose の実運用経路)
+    # 流し、そこから AMCL が追う (publish_initialpose の実運用経路)。
+    # amcl_sup ではさらに OFL が AMCL の姿勢を毎スキャン検証し、壊れていると
+    # 判断したら撒き直させる。**2 つの違いは supervise_amcl だけ**である。
     LOC_NODES="map_server, amcl"
+    SUPERVISE=false
+    [ "${LOC}" = "amcl_sup" ] && SUPERVISE=true
     ros2 run nav2_amcl amcl --ros-args --params-file "${PARAMS}" \
         -r __node:=amcl -p use_sim_time:=true \
         -p set_initial_pose:=false > /out/loc.log 2>&1 &
@@ -97,6 +103,8 @@ case "${LOC}" in
     ros2 run oriented_field_localization ofl_node --ros-args \
         -p use_sim_time:=true -p map_yaml_path:=/out/env/office.yaml \
         -p auto_localize:=true -p tf_mode:=none -p publish_initialpose:=true \
+        -p supervise_amcl:=${SUPERVISE} \
+        -r amcl_pose:=/amcl_pose \
         -p max_range:=10.0 -p margin_pixels:=284 \
         ${OFL_ARGS} > /out/ofl_init.log 2>&1 &
     ;;

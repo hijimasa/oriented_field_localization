@@ -10,12 +10,19 @@
 // オドメトリが無い場合は最後の採択姿勢をそのまま使う (スキャン間の移動が
 // track_search_m に収まる前提)。
 //
+// supervise_amcl: true にすると、自分で map -> odom を出す代わりに **AMCL を
+// 監視する**。AMCL の姿勢を毎スキャン WFRAC で検証し、壊れていると判断したときだけ
+// /initialpose で撒き直させる。閉ループでは AMCL は静的な世界では安定なのに、
+// 動く障害物と kidnap では長時間 (あるいは永久に) 戻れない (docs/nav2_closed_loop.md)。
+// 判定と鈍らせ方は reseed_policy.hpp。
+//
 // トピック:
-//   subscribe  scan   sensor_msgs/LaserScan
-//              map    nav_msgs/OccupancyGrid   (map_yaml_path 未指定のとき)
-//              odom   nav_msgs/Odometry        (use_odometry のとき)
+//   subscribe  scan       sensor_msgs/LaserScan
+//              map        nav_msgs/OccupancyGrid   (map_yaml_path 未指定のとき)
+//              odom       nav_msgs/Odometry        (use_odometry のとき)
+//              amcl_pose  geometry_msgs/PoseWithCovarianceStamped (supervise_amcl のとき)
 //   publish    ~/pose                  geometry_msgs/PoseWithCovarianceStamped
-//              /initialpose            同上 (GLOBAL からの引き継ぎ時のみ)
+//              /initialpose            同上 (引き継ぎ・再シードのとき)
 //              ~/candidates            geometry_msgs/PoseArray
 //   service    ~/global_localization   std_srvs/Empty   (GLOBAL 探索の強制)
 //
@@ -23,6 +30,7 @@
 // ではない (T_map_odom = T_map_base * T_odom_base^-1)。odom を出すノードが居ない
 // 構成のために tf_mode: map_to_base も用意してある。
 #include "oriented_field_localization/oriented_field_matcher.hpp"
+#include "oriented_field_localization/reseed_policy.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
@@ -49,6 +57,10 @@ using oriented_field_localization::Beam;
 using oriented_field_localization::MatcherParams;
 using oriented_field_localization::OrientedFieldLocalizer;
 using oriented_field_localization::PoseCandidate;
+using oriented_field_localization::ReseedEvidence;
+using oriented_field_localization::ReseedPolicy;
+using oriented_field_localization::ReseedPolicyParams;
+using oriented_field_localization::reseedPosesDisagree;
 
 namespace
 {
@@ -152,6 +164,22 @@ public:
     publish_initialpose_ = declare_parameter("publish_initialpose", true);
     initialpose_repeat_ = declare_parameter("initialpose_repeat", 5);
     initialpose_wait_s_ = declare_parameter("initialpose_wait_s", 60);
+    // AMCL はこの分散でパーティクルを撒き直す。既定は「この格子で解いた解の
+    // 不確かさ」に相当する控えめな値で、絞りすぎると誤差を吸収できなくなる。
+    initialpose_cov_xy_ = declare_parameter("initialpose_cov_xy", 0.25);
+    initialpose_cov_yaw_ = declare_parameter("initialpose_cov_yaw", 0.07);
+    // ---- AMCL の監視 ----
+    supervise_amcl_ = declare_parameter("supervise_amcl", false);
+    ReseedPolicyParams rp;
+    rp.max_wfrac = declare_parameter("supervise_max_wfrac", rp.max_wfrac);
+    rp.wfrac_excess = declare_parameter("supervise_wfrac_excess", rp.wfrac_excess);
+    rp.min_disagreement_m =
+      declare_parameter("supervise_min_disagreement_m", rp.min_disagreement_m);
+    rp.min_disagreement_deg =
+      declare_parameter("supervise_min_disagreement_deg", rp.min_disagreement_deg);
+    rp.after_scans = declare_parameter("supervise_after_scans", rp.after_scans);
+    rp.min_interval_s = declare_parameter("supervise_min_interval_s", rp.min_interval_s);
+    reseed_ = ReseedPolicy(rp);
     update_min_d_ = declare_parameter("update_min_d", 0.2);
     update_min_a_deg_ = declare_parameter("update_min_a_deg", 15.0);
     update_max_interval_s_ = declare_parameter("update_max_interval_s", 1.0);
@@ -199,6 +227,15 @@ public:
       odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
         "odom", sensor_qos,
         [this](nav_msgs::msg::Odometry::SharedPtr msg) {onOdom(msg);});
+    }
+
+    if (supervise_amcl_) {
+      // AMCL の推定姿勢。nav2_amcl は更新のたびに reliable / volatile で出す。
+      amcl_sub_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+        "amcl_pose", rclcpp::QoS(1).reliable(),
+        [this](geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg) {
+          onAmclPose(msg);
+        });
     }
 
     if (map_yaml.empty()) {
@@ -257,9 +294,10 @@ public:
     }
 
     worker_ = std::thread(&OflNode::workerLoop, this);
-    RCLCPP_INFO(get_logger(), "ready (%s, TRACK %s, odometry %s)",
+    RCLCPP_INFO(get_logger(), "ready (%s, TRACK %s, odometry %s, supervise %s)",
       auto_localize_ ? "auto_localize" : "call ~/global_localization",
-      enable_track_ ? "on" : "off", use_odometry_ ? "on" : "off");
+      enable_track_ ? "on" : "off", use_odometry_ ? "on" : "off",
+      supervise_amcl_ ? "amcl" : "off");
   }
 
   ~OflNode() override
@@ -335,6 +373,18 @@ private:
     odom_ = {msg->pose.pose.position.x, msg->pose.pose.position.y,
       yawOf(msg->pose.pose.orientation)};
     has_odom_ = true;
+  }
+
+  void onAmclPose(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
+  {
+    std::lock_guard<std::mutex> lk(state_mu_);
+    amcl_pose_ = {msg->pose.pose.position.x, msg->pose.pose.position.y,
+      yawOf(msg->pose.pose.orientation)};
+    // 受け取った時点のオドメトリを一緒に控える。AMCL の publish はこちらの
+    // スキャンと非同期なので、比べるときはこの差分で今の時刻まで運ぶ。
+    odom_at_amcl_ = odom_;
+    had_odom_at_amcl_ = has_odom_;
+    has_amcl_ = true;
   }
 
   void onScan(const sensor_msgs::msg::LaserScan::SharedPtr msg)
@@ -428,6 +478,9 @@ private:
             out.x = prior.x; out.y = prior.y; out.yaw = prior.yaw; out.score = 0;
             publishPose(out, odom_now, scan->header.stamp,
               /*also_initialpose=*/false, /*snap=*/false, /*have_odom=*/true);
+            // **監視は探索を間引いても毎スキャン走らせる。**AMCL が外れるのは
+            // こちらが動いていない間かもしれないし、WFRAC は探索と桁が違って安い。
+            superviseAmcl(out, w, beams, odom_now);
             continue;
           }
           // WFRAC が閾値を超えた: 動いていなくても探索する
@@ -490,14 +543,89 @@ private:
         continue;
       }
 
+      // 監視には**同じスキャンで測った自分の WFRAC**が基準線として要る。
+      // TRACK では上の (2) で測っているが、GLOBAL 採択では未測定なので補う。
+      if (supervise_amcl_ && wfrac < 0) wfrac = localizer_->wallMissFraction(best, beams);
+
+      // 追跡喪失からの再取得は従来どおり /initialpose を出すが、監視モードでは
+      // **AMCL が既に同じ場所を指しているなら出さない**。撒き直しても直るものが
+      // 無く、跳びだけが残る。
+      const bool reseed_ok = !supervise_amcl_ || amclDisagrees(best, odom_now);
+
       onAccept(best, odom_now, scan->header.stamp, use_track, margin, dt, cands.size(),
-        wfrac);
+        wfrac, reseed_ok);
+
+      // **自分が TRACK で自己整合しているときだけ相手を裁く。**GLOBAL の単発解は
+      // 曖昧解を引いている可能性があり、基準線として信用できない。
+      if (use_track) superviseAmcl(best, wfrac, beams, odom_now);
+      else reseed_.reset();
     }
+  }
+
+  /// 最後に受けた AMCL の姿勢を、オドメトリで今の時刻まで運んで返す。
+  /// AMCL がまだ何も出していなければ false。
+  bool amclPoseNow(const Pose2D & odom_now, Pose2D * out)
+  {
+    std::lock_guard<std::mutex> lk(state_mu_);
+    if (!has_amcl_) return false;
+    *out = amcl_pose_;
+    if (use_odometry_ && has_odom_ && had_odom_at_amcl_) {
+      *out = compose(amcl_pose_, relative(odom_at_amcl_, odom_now));
+    }
+    return true;
+  }
+
+  /// AMCL の姿勢が自分の解と離れているか。
+  /// **まだ何も出していなければ true** (= 初期姿勢を与えるべき) を返すので、
+  /// 起動時の引き継ぎと走行中の再シードが同じ判定で書ける。
+  bool amclDisagrees(const PoseCandidate & mine, const Pose2D & odom_now)
+  {
+    Pose2D amcl;
+    if (!amclPoseNow(odom_now, &amcl)) return true;
+    ReseedEvidence e;
+    e.disagree_m = std::hypot(mine.x - amcl.x, mine.y - amcl.y);
+    e.disagree_deg = std::fabs(wrapPi(mine.yaw - amcl.yaw)) * 180.0 / M_PI;
+    return reseedPosesDisagree(e, reseed_.params());
+  }
+
+  /// AMCL の姿勢を毎スキャン検証し、壊れていると判断したときだけ再シードする。
+  /// 判定そのものは reseed_policy.hpp にあり、そちらは ROS に依存しない。
+  void superviseAmcl(
+    const PoseCandidate & mine, double my_wfrac, const std::vector<Beam> & beams,
+    const Pose2D & odom_now)
+  {
+    if (!supervise_amcl_) return;
+    Pose2D amcl;
+    if (!amclPoseNow(odom_now, &amcl)) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+        "supervise_amcl is on but no amcl_pose received yet");
+      return;
+    }
+    PoseCandidate ac;
+    ac.x = amcl.x; ac.y = amcl.y; ac.yaw = amcl.yaw;
+
+    ReseedEvidence e;
+    e.wfrac_other = localizer_->wallMissFraction(ac, beams);
+    e.wfrac_self = my_wfrac;
+    e.disagree_m = std::hypot(mine.x - amcl.x, mine.y - amcl.y);
+    e.disagree_deg = std::fabs(wrapPi(mine.yaw - amcl.yaw)) * 180.0 / M_PI;
+
+    const bool fire = reseed_.update(e, now().seconds());
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+      "supervise: amcl wfrac %.3f (self %.3f) apart %.2f m %.1f deg, hits %d",
+      e.wfrac_other, e.wfrac_self, e.disagree_m, e.disagree_deg, reseed_.hits());
+    if (!fire) return;
+
+    RCLCPP_WARN(get_logger(),
+      "amcl looks lost (wfrac %.3f vs self %.3f, apart %.2f m, %.1f deg); reseeding",
+      e.wfrac_other, e.wfrac_self, e.disagree_m, e.disagree_deg);
+    publishInitialPose(makePoseMsg({mine.x, mine.y, mine.yaw}, now()));
   }
 
   void onAccept(
     const PoseCandidate & best, const Pose2D & odom_now, const rclcpp::Time & stamp,
-    bool was_track, double margin, double dt, size_t n_cands, double wfrac)
+    bool was_track, double margin, double dt, size_t n_cands, double wfrac,
+    bool reseed_ok)
   {
     bool became_track = false;
     bool first_lock = false;
@@ -518,7 +646,8 @@ private:
       }
     }
     // GLOBAL からの採択 (初回ロック・追跡喪失からの復帰) は平滑化せず即座に反映する
-    publishPose(best, odom_now, stamp, /*also_initialpose=*/!was_track && first_lock,
+    publishPose(best, odom_now, stamp,
+      /*also_initialpose=*/!was_track && first_lock && reseed_ok,
       /*snap=*/!was_track, have_odom);
     RCLCPP_INFO(get_logger(),
       "%s accept (%.2f, %.2f, %.1f deg) score %.4f margin %.2f wfrac %.3f in %.0f ms "
@@ -543,6 +672,9 @@ private:
         requested_ = true;      // auto_localize でなくても 1 回は GLOBAL を回す
       }
     }
+    // **自分が棄却したスキャンでは相手を裁かない。**自分の WFRAC が監視の
+    // 基準線なので、それが信用できないときの差には意味が無い。
+    reseed_.reset();
     RCLCPP_INFO(get_logger(), "%s reject (%s %.2f %.2f)%s",
       was_track ? "TRACK" : "GLOBAL", why, a, b,
       back_to_global ? " -> GLOBAL" : "");
@@ -616,27 +748,43 @@ private:
     return out_pose_;
   }
 
-  void publishPose(
-    const PoseCandidate & c, const Pose2D & odom_now, const rclcpp::Time & stamp,
-    bool also_initialpose, bool snap, bool have_odom)
+  geometry_msgs::msg::PoseWithCovarianceStamped makePoseMsg(
+    const Pose2D & out, const rclcpp::Time & stamp) const
   {
-    const Pose2D out = smoothOutput({c.x, c.y, c.yaw}, odom_now, snap, have_odom);
     geometry_msgs::msg::PoseWithCovarianceStamped m;
     m.header.stamp = stamp;
     m.header.frame_id = map_frame_;
     m.pose.pose.position.x = out.x;
     m.pose.pose.position.y = out.y;
     m.pose.pose.orientation = yawQuat(out.yaw);
-    m.pose.covariance[0] = 0.25;
-    m.pose.covariance[7] = 0.25;
-    m.pose.covariance[35] = 0.07;
+    m.pose.covariance[0] = initialpose_cov_xy_;
+    m.pose.covariance[7] = initialpose_cov_xy_;
+    m.pose.covariance[35] = initialpose_cov_yaw_;
+    return m;
+  }
+
+  /// /initialpose を出し、購読者が現れるまで出し直す準備をする。
+  void publishInitialPose(const geometry_msgs::msg::PoseWithCovarianceStamped & m)
+  {
+    if (!publish_initialpose_) return;
+    initialpose_pub_->publish(m);
+    std::lock_guard<std::mutex> lk(initialpose_mu_);
+    initialpose_msg_ = m;
+    initialpose_left_ = initialpose_repeat_ - 1;
+    initialpose_waited_ = 0;
+  }
+
+  void publishPose(
+    const PoseCandidate & c, const Pose2D & odom_now, const rclcpp::Time & stamp,
+    bool also_initialpose, bool snap, bool have_odom)
+  {
+    const Pose2D out = smoothOutput({c.x, c.y, c.yaw}, odom_now, snap, have_odom);
+    const auto m = makePoseMsg(out, stamp);
     pose_pub_->publish(m);
-    if (also_initialpose && publish_initialpose_) {
-      initialpose_pub_->publish(m);
-      std::lock_guard<std::mutex> lk(initialpose_mu_);
-      initialpose_msg_ = m;
-      initialpose_left_ = initialpose_repeat_ - 1;
-      initialpose_waited_ = 0;
+    if (also_initialpose) {
+      publishInitialPose(m);
+      // 引き継ぎも再シードも同じ最小間隔で数える (連続して撒き直さない)
+      reseed_.noteFired(now().seconds());
     }
 
     if (!tf_broadcaster_) return;
@@ -693,6 +841,10 @@ private:
   bool publish_initialpose_ = true;
   int initialpose_repeat_ = 5;
   int initialpose_wait_s_ = 60;
+  double initialpose_cov_xy_ = 0.25;
+  double initialpose_cov_yaw_ = 0.07;
+  bool supervise_amcl_ = false;
+  ReseedPolicy reseed_;
   double update_min_d_ = 0.2;           ///< これだけ動くまで探索しない [m]。0 で無効
   double update_min_a_deg_ = 15.0;      ///< 同 [deg]
   double update_max_interval_s_ = 1.0;  ///< 停止していても この間隔では探索する [s]
@@ -726,6 +878,12 @@ private:
   std::atomic<int> skipped_{0};         ///< 探索を省いたスキャン数
   int consecutive_accepts_ = 0, consecutive_rejects_ = 0;
 
+  // AMCL の最後の姿勢と、それを受けた時点のオドメトリ (比較のときに今へ運ぶ)
+  Pose2D amcl_pose_;
+  Pose2D odom_at_amcl_;
+  bool has_amcl_ = false;
+  bool had_odom_at_amcl_ = false;
+
   std::mutex initialpose_mu_;
   geometry_msgs::msg::PoseWithCovarianceStamped initialpose_msg_;
   int initialpose_left_ = 0;
@@ -738,6 +896,7 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initialpose_pub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr amcl_sub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr candidates_pub_;
   rclcpp::Service<std_srvs::srv::Empty>::SharedPtr service_;
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;

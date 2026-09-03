@@ -140,6 +140,45 @@
                                  # **購読者が居ない間は回数を消費せずに待つ**ので、
                                  # 起動順に依存しない
     initialpose_wait_s: 60       # 購読者を待つ上限 [s]。誰も来なければ諦める
+    initialpose_cov_xy: 0.25     # /initialpose と ~/pose に載せる分散 [m^2]。
+                                 # AMCL はこれでパーティクルを撒き直すので、
+                                 # 絞りすぎると引き渡した誤差を吸収できなくなる
+    initialpose_cov_yaw: 0.07    # 同 [rad^2]
+
+    # ---- AMCL の監視 (既定は無効) ----
+    # true にすると、自分で map -> odom を出す代わりに **AMCL を監視する**。
+    # AMCL の姿勢を毎スキャン WFRAC で検証し、壊れていると判断したときだけ
+    # /initialpose で撒き直させる。tf_mode: none と組にして使う。
+    #
+    # **なぜ AMCL を監視する価値があるか。**閉ループ 300 秒の実測で、AMCL は
+    # 静的な世界では本手法より安定だが、地図に無い動く障害物では 3 回中 2 回で
+    # 22 秒・106 秒のあいだ 0.5 m 以上外れ、kidnap では 2 回中 2 回とも最後まで
+    # 戻らなかった (docs/nav2_closed_loop.md)。AMCL は大域探索を持たないので、
+    # 一度外れると自力では戻れない。
+    #
+    # **なぜ WFRAC の絶対値では判定できないか。**地図に無い障害物があると正常時の
+    # WFRAC そのものが 0.50 近くまで上がるので、静的な世界で較正した 0.35 では
+    # 誤ロックと区別がつかない。**同じスキャンで測った自分の WFRAC を基準線にして
+    # その差を見る**と、障害物は両方に同じだけ乗るので相殺される。
+    #
+    # **再シードは無料ではない。**/initialpose はパーティクルを撒き直すので、
+    # それ自体が姿勢の跳びを作り、局所 costmap が odom フレームにある以上は
+    # 経路が無効になって follow_path が abort する (実測 2.5 秒の停止)。
+    # 誤発火のコストは検出の遅れより高いので、連続回数と最小間隔で鈍らせてある。
+    supervise_amcl: false
+    supervise_max_wfrac: 0.35        # 相手の WFRAC がこれ以下なら健全とみなす
+    supervise_wfrac_excess: 0.15     # **自分の WFRAC からの超過分**の下限。
+                                     # 実測の分離: 正常 0.00 / 障害物込み 0.50 /
+                                     # 誤ロック 0.74。障害物は両方に乗るので
+                                     # 差は 0.02 程度にしかならない
+    supervise_min_disagreement_m: 0.5   # これ以上離れていなければ再シードしない [m]。
+                                        # 同じ場所を指しているなら撒き直しても
+                                        # 直るものが無く、跳びだけが残る
+    supervise_min_disagreement_deg: 20.0  # 同 [deg]。0 で無効
+    supervise_after_scans: 10        # 証拠がこの回数連続したら発火する
+                                     # (10 Hz なら 1 秒ぶん)
+    supervise_min_interval_s: 10.0   # 再シードの最小間隔 [s]。起動時の引き継ぎとも
+                                     # 共有するので、撒き直しは連発しない
     tf_mode: "none"              # none / map_to_odom / map_to_base
                                  # map_to_odom は REP-105 準拠 (use_odometry 必須)
     transform_tolerance: 0.2     # TF を先付けする時間 [s]

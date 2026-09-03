@@ -97,8 +97,9 @@ Set `auto_localize: true` to run on every incoming scan.
 | subscribe | `scan` | `sensor_msgs/msg/LaserScan` | 2D LiDAR scan |
 | subscribe | `map` | `nav_msgs/msg/OccupancyGrid` | when `map_yaml_path` is unset |
 | subscribe | `odom` | `nav_msgs/msg/Odometry` | when `use_odometry: true` |
+| subscribe | `amcl_pose` | `geometry_msgs/msg/PoseWithCovarianceStamped` | when `supervise_amcl: true` |
 | publish | `~/pose` | `geometry_msgs/msg/PoseWithCovarianceStamped` | accepted pose (every time) |
-| publish | `/initialpose` | as above | only on the first accept out of GLOBAL (handoff to AMCL) |
+| publish | `/initialpose` | as above | on handoff and on reseed (to AMCL) |
 | publish | `~/candidates` | `geometry_msgs/msg/PoseArray` | candidates, for RViz / diagnosis |
 | service | `~/global_localization` | `std_srvs/srv/Empty` | drop tracking and restart from GLOBAL |
 | TF | `map -> odom` or `map -> base_frame` | TF2 | selected by `tf_mode` |
@@ -136,6 +137,7 @@ Set `auto_localize: true` to run on every incoming scan.
 | `smooth_base_m` | `0.0` | damp **only the published pose** (the internal prior stays raw); 0 disables. `0.005` is recommended for gentle motion |
 | `smooth_gain` | `0.5` | the part of the correction authority that scales with motion; a fixed cap lags during aggressive maneuvering |
 | `tf_mode` | `none` | `none` / `map_to_odom` (REP-105) / `map_to_base` |
+| `supervise_amcl` | `false` | true makes this node **supervise AMCL** (see below); pair it with `tf_mode: none` |
 
 Important invariants:
 
@@ -166,9 +168,12 @@ colcon test --packages-select oriented_field_localization
 colcon test-result --verbose
 ```
 
-The ROS-independent unit test (19 checks) covers the parameter invariants, recovery of known
-poses, the candidate pool's properties (score ordering, NMS separation, size cap), the sign
-of WFRAC, and TRACK's pull-in and window boundary.
+There are two ROS-independent unit tests. `test_matcher` (20 checks) covers the parameter
+invariants, recovery of known poses, the candidate pool's properties (score ordering, NMS
+separation, size cap), the sign of WFRAC, and TRACK's pull-in and window boundary.
+`test_reseed_policy` (21 checks) covers the AMCL supervision rule — that dynamic obstacles
+do not trigger it, that a pose AMCL already agrees with is never reseeded, and the
+consecutive-hit count and minimum interval.
 
 ## Continuous-drive validation in Gazebo
 
@@ -228,6 +233,44 @@ cd eval && ./run_compare.sh out 40
 `disturb_eval2 --dump` in the sibling `radon_global_localization` package, so the same map
 and trial count give **byte-identical scans** and the two packages' numbers line up.
 
+## Using it to supervise AMCL
+
+Instead of publishing `map -> odom` itself, this node can sit **next to an existing AMCL and
+supervise it**. Nothing changes on the AMCL side beyond `set_initial_pose: false`.
+
+```bash
+ros2 launch oriented_field_localization amcl_supervisor.launch.py \
+  map_yaml_path:=/absolute/path/to/map.yaml
+```
+
+In that mode the node
+
+- hands AMCL its initial pose automatically (no more setting it by hand in RViz), and
+- keeps checking AMCL's pose against the map on every scan, reseeding it when it is broken.
+
+Measured over eight 300 s closed-loop runs
+([docs/en/amcl_supervision.md](docs/en/amcl_supervision.md)):
+
+| Condition | Median error | Time > 0.5 m | Goals | Distance driven |
+|---|---:|---:|---:|---:|
+| kidnap, unsupervised (2 runs) | 1.40 / 1.27 m | **183 / 182 s** | 3/10, 3/11 | 27 / 26 m |
+| kidnap, supervised (2 runs) | **0.058 / 0.053 m** | **7.8 / 5.3 s** | 14/15, 14/15 | 132 / 134 m |
+| dynamic obstacles, unsupervised | 2.60 m | **253 s** | 4/11 | 43 m |
+| dynamic obstacles, supervised | **0.059 m** | **0.0 s** | 16/17 | 136 m |
+
+**A mis-lock cannot be detected from an absolute WFRAC**, because obstacles missing from the
+map push the healthy WFRAC itself close to 0.50. Comparing against **our own WFRAC measured
+on the same scan** cancels that, since the obstacles land on both poses equally. The rule
+lives in
+[reseed_policy.hpp](include/oriented_field_localization/reseed_policy.hpp), is independent of
+ROS, and has 21 unit tests.
+
+**Reseeding is not free.** `/initialpose` scatters the particle cloud, which is itself a pose
+jump, and because the local costmap lives in the odom frame the path is invalidated and
+`follow_path` aborts. The decision is therefore damped by a consecutive-hit count and a
+minimum interval, and **no reseed happens — including the startup handoff — while AMCL points
+at the same place we do**.
+
 ## Relationship to the sibling package
 
 `radon_global_localization` matches the same representation in Radon (sinogram) space. This
@@ -244,19 +287,26 @@ focuses on the GLOBAL and TRACK searches themselves.
 
 ```text
 oriented_field_localization/
-├── include/oriented_field_localization/oriented_field_matcher.hpp
+├── include/oriented_field_localization/
+│   ├── oriented_field_matcher.hpp
+│   └── reseed_policy.hpp            # AMCL supervision rule (ROS-independent)
 ├── src/
 │   ├── oriented_field_matcher.cpp   # ROS-independent matching library
-│   └── ofl_node.cpp                 # ROS 2 node (global search only)
-├── launch/global_localization.launch.py
+│   └── ofl_node.cpp                 # ROS 2 node
+├── launch/
+│   ├── global_localization.launch.py  # standalone (publishes map -> odom itself)
+│   └── amcl_supervisor.launch.py      # supervising an existing AMCL
 ├── config/params.yaml
-├── tests/test_matcher.cpp
+├── tests/
+│   ├── test_matcher.cpp
+│   └── test_reseed_policy.cpp
 ├── sim/                             # continuous-drive validation in Gazebo
 │                                     #   (open loop: run_sim.sh, closed loop: run_nav2.sh)
 │   ├── make_env.py                  # world, map and route from one wall definition
 │   ├── models/robot.urdf
 │   ├── drive_node.py                # path following (ground truth) and error recording
-│   └── run_sim.sh
+│   ├── run_sim.sh
+│   └── docker/                      # Gazebo Classic + Nav2 runtime for the sim
 ├── eval/                            # comparison harness against BBS
 │   ├── make_scans.cpp               # pose sampling + disturbed scan generation
 │   ├── ofl_eval.cpp                 # evaluator for this method
@@ -270,6 +320,7 @@ oriented_field_localization/
     ├── benchmark.md                 # comparison against BBS / Radon
     ├── simulation.md                # continuous-drive validation (open loop)
     ├── nav2_closed_loop.md          # closed loop with Nav2, and dynamic obstacles
+    ├── amcl_supervision.md          # supervising AMCL and reseeding it, measured
     └── en/                          # English versions of the above
 ```
 

@@ -92,8 +92,9 @@ ros2 service call \
 | subscribe | `scan` | `sensor_msgs/msg/LaserScan` | 2D LiDAR スキャン |
 | subscribe | `map` | `nav_msgs/msg/OccupancyGrid` | `map_yaml_path` 未指定時 |
 | subscribe | `odom` | `nav_msgs/msg/Odometry` | `use_odometry: true` のとき |
+| subscribe | `amcl_pose` | `geometry_msgs/msg/PoseWithCovarianceStamped` | `supervise_amcl: true` のとき |
 | publish | `~/pose` | `geometry_msgs/msg/PoseWithCovarianceStamped` | 採択した姿勢 (毎回) |
-| publish | `/initialpose` | 同上 | GLOBAL から初めて採択したときだけ (AMCL への引き継ぎ) |
+| publish | `/initialpose` | 同上 | 引き継ぎ・再シードのとき (AMCL への受け渡し) |
 | publish | `~/candidates` | `geometry_msgs/msg/PoseArray` | 候補の可視化・診断 |
 | service | `~/global_localization` | `std_srvs/srv/Empty` | 追跡を捨てて GLOBAL からやり直す |
 | TF | `map -> odom` または `map -> base_frame` | TF2 | `tf_mode` で選択 |
@@ -131,6 +132,7 @@ ros2 service call \
 | `smooth_base_m` | `0.0` | **出力する姿勢だけ**を鈍らせる (内部の事前姿勢は生のまま)。0 で無効。穏やかに走る用途では `0.005` を推奨 |
 | `smooth_gain` | `0.5` | 補正権限のうち運動量に比例するぶん。固定上限だと激しい機動で遅れる |
 | `tf_mode` | `none` | `none` / `map_to_odom` (REP-105) / `map_to_base` |
+| `supervise_amcl` | `false` | true で **AMCL の監視役**になる (下記)。`tf_mode: none` と組で使う |
 
 重要な不変条件:
 
@@ -159,9 +161,11 @@ colcon test --packages-select oriented_field_localization
 colcon test-result --verbose
 ```
 
-ROS 非依存の単体テスト (19 項目) は、パラメータの不変条件、既知姿勢の復元、候補プールの
-性質 (スコア降順・NMS 分離・上限)、WFRAC の符号、TRACK の引き込みと窓の境界を
-検査します。
+ROS 非依存の単体テストが 2 本あります。`test_matcher` (20 項目) はパラメータの
+不変条件、既知姿勢の復元、候補プールの性質 (スコア降順・NMS 分離・上限)、WFRAC の
+符号、TRACK の引き込みと窓の境界を検査します。`test_reseed_policy` (21 項目) は
+AMCL 監視の判定 — 動く障害物で誤発火しないこと、姿勢が一致していれば撒き直さない
+こと、連続回数と最小間隔 — を検査します。
 
 ## Gazebo での連続走行検証
 
@@ -220,6 +224,41 @@ cd eval && ./run_compare.sh out 40
 `disturb_eval2 --dump` と同一なので、同じ地図・同じ試行数なら**バイト同一のスキャン**が
 得られ、両パッケージの数値を直接並べられます。
 
+## AMCL の監視役として使う
+
+自分で `map -> odom` を出す代わりに、**既存の AMCL の横に置いて監視させる**構成も
+できます。AMCL 側は `set_initial_pose: false` にするだけで、他は何も変えません。
+
+```bash
+ros2 launch oriented_field_localization amcl_supervisor.launch.py \
+  map_yaml_path:=/absolute/path/to/map.yaml
+```
+
+このノードは、
+
+- 起動時の初期姿勢を自動で与え (人が RViz で与えるのをやめられる)、
+- 走行中も AMCL の姿勢を毎スキャン WFRAC で検証して、壊れていたら撒き直させます。
+
+300 秒の閉ループ 8 走行での実測 ([docs/amcl_supervision.md](docs/amcl_supervision.md)):
+
+| 条件 | 位置誤差 中央 | >0.5 m の合計 | 到達 | 実走行距離 |
+|---|---:|---:|---:|---:|
+| kidnap・監視なし (2 走行) | 1.40 / 1.27 m | **183 / 182 s** | 3/10, 3/11 | 27 / 26 m |
+| kidnap・監視あり (2 走行) | **0.058 / 0.053 m** | **7.8 / 5.3 s** | 14/15, 14/15 | 132 / 134 m |
+| 動的障害物・監視なし | 2.60 m | **253 s** | 4/11 | 43 m |
+| 動的障害物・監視あり | **0.059 m** | **0.0 s** | 16/17 | 136 m |
+
+**誤ロックの検出は WFRAC の絶対値ではできません。**地図に無い障害物があると正常時の
+WFRAC そのものが 0.50 近くまで上がるためです。**同じスキャンで測った自分の WFRAC を
+基準線にしてその差を見る**と、障害物は両方の姿勢に同じだけ乗るので相殺されます。
+判定は [reseed_policy.hpp](include/oriented_field_localization/reseed_policy.hpp) に
+ROS 非依存で置いてあり、単体テストが 21 項目あります。
+
+**再シードは無料ではありません。**`/initialpose` はパーティクルを撒き直すので、それ自体が
+姿勢の跳びを作り、局所 costmap が odom フレームにある以上は経路が無効になって
+`follow_path` が abort します。そのため判定は連続回数と最小間隔で鈍らせてあり、
+**AMCL が自分と同じ場所を指しているときは (起動時の引き継ぎを含めて) 再シードしません**。
+
 ## 姉妹パッケージとの関係
 
 `radon_global_localization` は同じ表現をラドン変換 (サイノグラム) 空間で照合します。
@@ -235,13 +274,19 @@ TRACK の探索そのものに絞ってあります。
 
 ```text
 oriented_field_localization/
-├── include/oriented_field_localization/oriented_field_matcher.hpp
+├── include/oriented_field_localization/
+│   ├── oriented_field_matcher.hpp
+│   └── reseed_policy.hpp            # AMCL 監視の判定 (ROS 非依存)
 ├── src/
 │   ├── oriented_field_matcher.cpp   # ROS 非依存のマッチングライブラリ
-│   └── ofl_node.cpp                 # ROS 2 ノード (大域探索のみ)
-├── launch/global_localization.launch.py
+│   └── ofl_node.cpp                 # ROS 2 ノード
+├── launch/
+│   ├── global_localization.launch.py  # 単体 (map -> odom を自分で出す)
+│   └── amcl_supervisor.launch.py      # AMCL の監視役
 ├── config/params.yaml
-├── tests/test_matcher.cpp
+├── tests/
+│   ├── test_matcher.cpp
+│   └── test_reseed_policy.cpp
 ├── sim/                             # Gazebo での連続走行検証
 │   ├── make_env.py                  # 壁の定義から world・地図・経路を生成
 │   ├── models/robot.urdf
@@ -250,7 +295,8 @@ oriented_field_localization/
 │   ├── run_sim.sh                   # [開ループ]
 │   ├── nav2_drive_node.py           # [閉ループ] 目標の送信と航法込みの記録
 │   ├── nav2_params.yaml             # [閉ループ] Nav2 の設定 (全条件で同一)
-│   └── run_nav2.sh                  # [閉ループ]
+│   ├── run_nav2.sh                  # [閉ループ]
+│   └── docker/                      # Gazebo Classic + Nav2 の実行環境
 ├── eval/                            # BBS との比較ハーネス
 │   ├── make_scans.cpp               # 姿勢サンプリング + 外乱スキャン生成
 │   ├── ofl_eval.cpp                 # 本手法の評価器
@@ -264,6 +310,7 @@ oriented_field_localization/
     ├── benchmark.md                 # BBS / Radon との比較
     ├── simulation.md                # Gazebo での連続走行検証 (開ループ)
     ├── nav2_closed_loop.md          # Nav2 との閉ループと動的障害物
+    ├── amcl_supervision.md          # AMCL の監視と再シードの実測
     └── en/                          # 上記の英語版
 ```
 
