@@ -7,5 +7,5 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE="${IMAGE:-bac_gazebo_runtime:humble}"
 echo "[build_image] building ${IMAGE} (Gazebo Classic + Nav2, 数 GB 落ちてくる)"
-docker build -t "${IMAGE}" "${HERE}"
+docker build --network=host -t "${IMAGE}" "${HERE}"
 echo "[build_image] done: ${IMAGE}"

@@ -78,6 +78,7 @@ class Nav2Driver(Node):
         self.t0 = None
         self.done = False
         self.kidnapped = False
+        self.reinitialized = False
         self.goal_active = False
         self.goal_handle = None
         self.goal_t0 = None
@@ -114,6 +115,11 @@ class Nav2Driver(Node):
         self.nav = ActionClient(self, NavigateToPose, 'navigate_to_pose')
         from gazebo_msgs.srv import SetEntityState
         self.set_state = self.create_client(SetEntityState, '/gazebo/set_entity_state')
+        # --reinit-at 用: AMCL の大域位置推定 (パーティクルを自由空間全域へ
+        # 一様に撒き直す)。「失敗を完璧に検知できた」というオラクルを仮定して
+        # 一様撒き直しという復帰手段そのものの実力を測るための口である
+        from std_srvs.srv import Empty
+        self.reinit = self.create_client(Empty, '/reinitialize_global_localization')
         self.create_timer(0.05, self.step)
 
     # ---------- 入力 ----------
@@ -275,6 +281,14 @@ class Nav2Driver(Node):
             self.kidnap()
             self.kidnapped = True
 
+        if (not self.reinitialized and self.a.reinit_at is not None
+                and t >= self.a.reinit_at and self.reinit.service_is_ready()):
+            from std_srvs.srv import Empty
+            self.reinit.call_async(Empty.Request())
+            self.events.append({'t': round(t, 2), 'ev': 'reinitialize'})
+            self.get_logger().info('called /reinitialize_global_localization')
+            self.reinitialized = True
+
         # map -> odom の跳び (制御へ直接入る不連続)
         jm = jd = 0.0
         if mo is not None:
@@ -395,6 +409,9 @@ def main():
     ap.add_argument('--dump-costmap', action='store_true',
                     help='最後の大域 costmap を PGM で保存する')
     ap.add_argument('--kidnap-at', type=float, default=None)
+    ap.add_argument('--reinit-at', type=float, default=None,
+                    help='この時刻に /reinitialize_global_localization を呼ぶ '
+                         '(オラクル検知を仮定した一様撒き直し)')
     ap.add_argument('--kidnap-to', type=float, nargs=3, default=[20.0, 3.5, 1.57])
     a = ap.parse_args(rclpy.utilities.remove_ros_args(sys.argv)[1:])
     route = [tuple(p) for p in json.load(open(a.route))['route']]

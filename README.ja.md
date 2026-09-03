@@ -252,6 +252,25 @@ ros2 launch oriented_field_localization amcl_supervisor.launch.py \
 | 動的障害物・監視なし | 2.60 m | **253 s** | 4/11 | 43 m |
 | 動的障害物・監視あり | **0.059 m** | **0.0 s** | 16/17 | 136 m |
 
+![kidnap からの復帰: AMCL 内蔵機構 vs OFL 監視](sim/videos/amcl_recovery_methods_3way_kidnap.gif)
+
+同じ 300 秒の閉ループ (120 秒で kidnap) を、AMCL の復帰手段 3 つで並べたもの
+(黒 = 真値、色 = 推定、赤線 = 誤差。動画本体は
+[sim/videos/amcl_recovery_methods_3way_kidnap.mp4](sim/videos/amcl_recovery_methods_3way_kidnap.mp4)):
+
+- **AMCL 内蔵の自動回復** (Augmented MCL、`recovery_alpha_slow/fast` 0.001/0.1。
+  nav2 の既定は無効): ランダム注入で推定は動き回る (2.7--13.9 m) が収束せず、
+  180 秒間ずっと >0.5 m
+- **一様撒き直し** (`/reinitialize_global_localization`)、kidnap の 1 秒後に
+  **オラクルで発動** (素の nav2 にはこのサービスを自動で呼ぶノードは無い):
+  検知が完璧でも 2,000 パーティクルの一様撒きでは残り走行のあいだ 1--3 m を漂い、
+  真の位置から 10 m 離れた場所で「目標到達」と誤認する場面もある
+- **OFL 監視**: 単一スキャンの GLOBAL 解で撒き直し、>0.5 m は合計 0.8 秒
+
+再現は `KIDNAP_AT=120 LOC=... ./sim/run_nav2.sh` で 3 条件を走らせ
+(`AMCL_ARGS` / `REINIT_AT` は [sim/run_nav2.sh](sim/run_nav2.sh) 冒頭のコメント参照)、
+[sim/render_compare_video.py](sim/render_compare_video.py) で描く。
+
 **誤ロックの検出は WFRAC の絶対値ではできません。**地図に無い障害物があると正常時の
 WFRAC そのものが 0.50 近くまで上がるためです。**同じスキャンで測った自分の WFRAC を
 基準線にしてその差を見る**と、障害物は両方の姿勢に同じだけ乗るので相殺されます。
@@ -307,6 +326,7 @@ oriented_field_localization/
 │   ├── nav2_drive_node.py           # [閉ループ] 目標の送信と航法込みの記録
 │   ├── nav2_params.yaml             # [閉ループ] Nav2 の設定 (全条件で同一)
 │   ├── run_nav2.sh                  # [閉ループ]
+│   ├── render_compare_video.py      # 複数走行を同期再生する比較動画
 │   └── docker/                      # Gazebo Classic + Nav2 の実行環境
 ├── eval/                            # BBS との比較ハーネス
 │   ├── make_scans.cpp               # 姿勢サンプリング + 外乱スキャン生成

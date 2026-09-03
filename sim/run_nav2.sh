@@ -14,8 +14,13 @@
 #              WFRAC で検証し、壊れていると判断したら撒き直させる (supervise_amcl)
 #   DYNAMIC    1 で地図に無い動く障害物を置く
 #   KIDNAP_AT  この秒数で瞬間移動させる
+#   REINIT_AT  この秒数で /reinitialize_global_localization を呼ぶ (オラクル検知を
+#              仮定した一様撒き直し。LOC=amcl と組み合わせて使う)
 #   IMAGE      Gazebo Classic + gazebo_ros + nav2 を持つ docker イメージ
 #   OFL_ARGS   ofl_node への追加パラメータ
+#   AMCL_ARGS  amcl への追加パラメータ (例: 内蔵の自動回復 (Augmented MCL) を
+#              有効にするなら "-p recovery_alpha_slow:=0.001 -p recovery_alpha_fast:=0.1"。
+#              nav2 の既定は 0.0 = 無効)
 #   OMP_NUM_THREADS  位置推定の相関に使うスレッド数 (既定 6)
 #   RETRIES    Nav2 の起動に失敗したときの再試行回数 (既定 2)
 #   CPU_LOG    1 で位置推定ノードの CPU 時間を 2 秒ごとに /out/cpu.log へ記録する
@@ -29,6 +34,10 @@ IMAGE="${IMAGE:-bac_gazebo_runtime:humble}"
 LOC="${LOC:-ofl}"
 
 mkdir -p "${OUT}"
+# docker run -v はスラッシュを含まない相対パスを bind mount ではなく
+# **名前付きボリューム**として解釈する (コンテナの /out が空になり、
+# route.json が無いという不可解な失敗になる)。絶対パスに正規化しておく。
+OUT="$(cd "${OUT}" && pwd)"
 DYNFLAG=""
 [ "${DYNAMIC:-0}" = "1" ] && DYNFLAG="--dynamic"
 # shellcheck disable=SC2086
@@ -39,8 +48,10 @@ docker run --rm --network none \
     -v "${PKG}:/ws/src/oriented_field_localization:ro" \
     -v "${OUT}:/out" \
     -e "DURATION=${DURATION}" -e "KIDNAP_AT=${KIDNAP_AT:-}" \
+    -e "REINIT_AT=${REINIT_AT:-}" \
     -e "LOC=${LOC}" -e "DYNAMIC=${DYNAMIC:-0}" \
-    -e "OFL_ARGS=${OFL_ARGS:-}" -e "OMP_NUM_THREADS=${OMP_NUM_THREADS:-6}" \
+    -e "OFL_ARGS=${OFL_ARGS:-}" -e "AMCL_ARGS=${AMCL_ARGS:-}" \
+    -e "OMP_NUM_THREADS=${OMP_NUM_THREADS:-6}" \
     -e "DUMP_COSTMAP=${DUMP_COSTMAP:-0}" -e "CPU_LOG=${CPU_LOG:-0}" \
     -e "OMP_WAIT_POLICY=${OMP_WAIT_POLICY:-}" \
     --entrypoint /bin/bash "${IMAGE}" -lc '
@@ -80,10 +91,12 @@ case "${LOC}" in
     ;;
   amcl)
     LOC_NODES="map_server, amcl"
+    # shellcheck disable=SC2086
     ros2 run nav2_amcl amcl --ros-args --params-file "${PARAMS}" \
         -r __node:=amcl -p use_sim_time:=true \
         -p initial_pose.x:="${SX}" -p initial_pose.y:="${SY}" \
-        -p initial_pose.z:=0.0 -p initial_pose.yaw:="${SYAW}" > /out/loc.log 2>&1 &
+        -p initial_pose.z:=0.0 -p initial_pose.yaw:="${SYAW}" \
+        ${AMCL_ARGS} > /out/loc.log 2>&1 &
     ;;
   gt)
     python3 ${SIM}/gt_tf_node.py --ros-args -p use_sim_time:=true > /out/loc.log 2>&1 &
@@ -96,9 +109,10 @@ case "${LOC}" in
     LOC_NODES="map_server, amcl"
     SUPERVISE=false
     [ "${LOC}" = "amcl_sup" ] && SUPERVISE=true
+    # shellcheck disable=SC2086
     ros2 run nav2_amcl amcl --ros-args --params-file "${PARAMS}" \
         -r __node:=amcl -p use_sim_time:=true \
-        -p set_initial_pose:=false > /out/loc.log 2>&1 &
+        -p set_initial_pose:=false ${AMCL_ARGS} > /out/loc.log 2>&1 &
     # shellcheck disable=SC2086
     ros2 run oriented_field_localization ofl_node --ros-args \
         -p use_sim_time:=true -p map_yaml_path:=/out/env/office.yaml \
@@ -163,6 +177,7 @@ fi
 # ---- 走行と記録 ----
 KID=""
 [ -n "${KIDNAP_AT}" ] && KID="--kidnap-at ${KIDNAP_AT}"
+[ -n "${REINIT_AT}" ] && KID="${KID} --reinit-at ${REINIT_AT}"
 CM=""
 [ "${DUMP_COSTMAP:-0}" = "1" ] && CM="--dump-costmap"
 HARD=$(python3 -c "print(int(${DURATION} * 3 + 300))")

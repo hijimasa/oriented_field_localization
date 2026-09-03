@@ -21,6 +21,10 @@ DURATION="${2:-180}"
 IMAGE="${IMAGE:-bac_gazebo_runtime:humble}"
 
 mkdir -p "${OUT}"
+# docker run -v はスラッシュを含まない相対パスを bind mount ではなく
+# **名前付きボリューム**として解釈する (コンテナの /out が空になり、
+# route.json が無いという不可解な失敗になる)。絶対パスに正規化しておく。
+OUT="$(cd "${OUT}" && pwd)"
 python3 "${HERE}/make_env.py" "${OUT}/env"
 
 docker run --rm --network none \

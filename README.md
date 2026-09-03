@@ -262,6 +262,28 @@ Measured over eight 300 s closed-loop runs
 | dynamic obstacles, unsupervised | 2.60 m | **253 s** | 4/11 | 43 m |
 | dynamic obstacles, supervised | **0.059 m** | **0.0 s** | 16/17 | 136 m |
 
+![Kidnap recovery: AMCL's built-in mechanisms vs OFL supervision](sim/videos/amcl_recovery_methods_3way_kidnap.gif)
+
+The same 300 s closed loop (kidnap at 120 s) under AMCL's three recovery options
+(black = ground truth, color = estimate, red = error; full video at
+[sim/videos/amcl_recovery_methods_3way_kidnap.mp4](sim/videos/amcl_recovery_methods_3way_kidnap.mp4)):
+
+- **AMCL's built-in recovery** (Augmented MCL, `recovery_alpha_slow/fast` 0.001/0.1;
+  disabled by default in nav2): the random injection makes the estimate wander
+  (2.7--13.9 m) but it never converges — wrong for the whole remaining 180 s
+- **Uniform re-scatter** (`/reinitialize_global_localization`) fired by an **oracle**
+  1 s after the kidnap (stock nav2 has no node that calls this service by itself):
+  even with perfect detection, 2,000 particles scattered over the map leave the
+  estimate hovering 1--3 m off for the rest of the run, once reporting a goal
+  reached 10 m from the true position
+- **OFL supervision**: reseeds with the single-scan GLOBAL solution; 0.8 s above
+  0.5 m in total
+
+To reproduce, run the three conditions with `KIDNAP_AT=120 LOC=... ./sim/run_nav2.sh`
+(see the header comments of [sim/run_nav2.sh](sim/run_nav2.sh) for `AMCL_ARGS` /
+`REINIT_AT`) and render with
+[sim/render_compare_video.py](sim/render_compare_video.py).
+
 **A mis-lock cannot be detected from an absolute WFRAC**, because obstacles missing from the
 map push the healthy WFRAC itself close to 0.50. Comparing against **our own WFRAC measured
 on the same scan** cancels that, since the obstacles land on both poses equally. The rule
@@ -316,6 +338,7 @@ oriented_field_localization/
 │   ├── models/robot.urdf
 │   ├── drive_node.py                # path following (ground truth) and error recording
 │   ├── run_sim.sh
+│   ├── render_compare_video.py      # synchronized replay video of multiple runs
 │   └── docker/                      # Gazebo Classic + Nav2 runtime for the sim
 ├── eval/                            # comparison harness against BBS
 │   ├── make_scans.cpp               # pose sampling + disturbed scan generation
